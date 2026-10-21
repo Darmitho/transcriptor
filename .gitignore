@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+# Transcripciones: pueden contener información de clientes
+transcripcion_*.txt
+.claude/settings.local.json
