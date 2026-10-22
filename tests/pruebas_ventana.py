@@ -131,7 +131,54 @@ def configuracion():
     return fallos
 
 
-PRUEBAS = [orden_cronologico, timer_vram, configuracion]
+def letra_y_colores():
+    """A−/A+ cambian la letra con límites y se recuerda; cada hablante lleva su color;
+    un color inválido guardado vuelve al inicial; Ajustes no se abre dos veces."""
+    fallos = []
+    with app_aislada():
+        with open(T.CONFIG_ARCHIVO, "w", encoding="utf-8") as f:
+            json.dump({"color_yo": "verdoso", "color_otros": "#ffcc00"}, f)
+        root = tk.Tk()
+        app = T.App(root)
+        app.cola_ui.put(("final", ("Yo", "Hola.", time.time())))
+        app.cola_ui.put(("final", ("Otros", "Buenas.", time.time() + 1)))
+        app._procesar_cola()
+        color = lambda fuente: app.texto.tag_cget(f"hablante_{fuente}", "foreground")
+        etiquetas = [app.texto.tag_names(f"{n}.12") for n in (1, 2)]
+        if color("Yo") != T.Configuracion.INICIAL["color_yo"] or color("Otros") != "#ffcc00":
+            fallos.append(("colores", color("Yo"), color("Otros")))
+        if "hablante_Yo" not in etiquetas[0] or "hablante_Otros" not in etiquetas[1]:
+            fallos.append(("etiquetas de las líneas", etiquetas))
+        app.cambiar_letra(+1)
+        if (app.letra.cget("size"), app.letra_hora.cget("size")) != (15, 11):
+            fallos.append(("A+", app.letra.cget("size"), app.letra_hora.cget("size")))
+        app.cambiar_letra(tamano=100)
+        tope = app.letra.cget("size")
+        app.cambiar_letra(tamano=1)
+        piso = app.letra.cget("size")
+        if (tope, piso) != (T.Configuracion.LETRA_MAX, T.Configuracion.LETRA_MIN):
+            fallos.append(("límites", tope, piso))
+        app.cambiar_letra(tamano=20)
+        app.abrir_ajustes()
+        primera = app.ajustes
+        app.abrir_ajustes()
+        if app.ajustes is not primera:
+            fallos.append(("Ajustes abierto dos veces",))
+        app.config["color_otros"] = "#00aaff"   # Lo que deja elegir_color tras el selector
+        app._aplicar_colores()
+        app.config.guardar()
+        root.destroy()
+
+        root = tk.Tk()
+        app = T.App(root)
+        recuperado = (app.letra.cget("size"), app.texto.tag_cget("hablante_Otros", "foreground"))
+        root.destroy()
+        if recuperado != (20, "#00aaff"):
+            fallos.append(("recuperado", recuperado))
+    return fallos
+
+
+PRUEBAS = [orden_cronologico, timer_vram, configuracion, letra_y_colores]
 
 
 def todas():

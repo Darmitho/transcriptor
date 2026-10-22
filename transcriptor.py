@@ -123,7 +123,8 @@ from scipy.signal import resample_poly
 from faster_whisper import WhisperModel
 from faster_whisper.vad import get_vad_model
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import colorchooser, filedialog, messagebox
+from tkinter import font as tkfont
 
 
 def _normalizar(texto):
@@ -651,7 +652,9 @@ class Configuracion(dict):
     """Preferencias de la ventana guardadas entre sesiones en CONFIG_ARCHIVO.
     Un archivo dañado o con valores de otro tipo no impide abrir: se usan los valores iniciales."""
 
-    INICIAL = {"idioma": IDIOMA, "siempre_encima": True, "geometria": "760x440"}
+    INICIAL = {"idioma": IDIOMA, "siempre_encima": True, "geometria": "760x440",
+               "tamano_letra": 14, "color_yo": "#7fd18b", "color_otros": "#e8e8e8"}
+    LETRA_MIN, LETRA_MAX = 9, 36
 
     def __init__(self, ruta=None):
         super().__init__(self.INICIAL)
@@ -727,15 +730,15 @@ class App:
         root.geometry(_geometria_visible(self.config["geometria"]))
         root.configure(bg=self.FONDO)
         root.attributes("-topmost", self.config["siempre_encima"])
+        self.estilo = dict(bg="#2b2d31", fg=self.TEXTO, activebackground="#3a3d43",
+                           activeforeground=self.TEXTO, relief="flat", padx=10, pady=4)
+        estilo = self.estilo
 
+        # Arriba: lo que controla la captura
         barra = tk.Frame(root, bg=self.FONDO)
-        barra.pack(fill="x", padx=8, pady=6)
-        estilo = dict(bg="#2b2d31", fg=self.TEXTO, activebackground="#3a3d43",
-                      activeforeground=self.TEXTO, relief="flat", padx=10, pady=4)
+        barra.pack(fill="x", padx=8, pady=(6, 2))
         self.btn = tk.Button(barra, text="▶ Iniciar", command=self.alternar, state="disabled", **estilo)
         self.btn.pack(side="left")
-        tk.Button(barra, text="Limpiar", command=self.limpiar, **estilo).pack(side="left", padx=4)
-        tk.Button(barra, text="Guardar...", command=self.guardar, **estilo).pack(side="left")
         self.mic = tk.BooleanVar(value=False)   # Apagado al iniciar: evita transcribirme por accidente
         tk.Checkbutton(barra, text="🎤 Micrófono", variable=self.mic, command=self._alternar_mic,
                        indicatoron=False, selectcolor="#2f6f3e", offrelief="flat",
@@ -750,21 +753,35 @@ class App:
         menu.configure(highlightthickness=0, **estilo)
         menu["menu"].configure(bg="#2b2d31", fg=self.TEXTO, activebackground="#3a3d43")
         menu.pack(side="left", padx=4)
-        self.encima = tk.BooleanVar(value=self.config["siempre_encima"])
-        tk.Checkbutton(barra, text="Siempre encima", variable=self.encima, command=self._encima,
-                       bg=self.FONDO, fg=self.TEXTO, selectcolor="#2b2d31",
-                       activebackground=self.FONDO, activeforeground=self.TEXTO).pack(side="left", padx=8)
+        tk.Button(barra, text="⚙", command=self.abrir_ajustes, **estilo).pack(side="left")
         self.estado = tk.Label(barra, text="", bg=self.FONDO, fg=self.GRIS, anchor="e")
         self.estado.pack(side="right", fill="x", expand=True)
 
-        self.texto = tk.Text(root, wrap="word", font=("Segoe UI", 14), bg=self.FONDO, fg=self.TEXTO,
+        # Abajo: lo que afecta al texto (se empaqueta antes que el texto para que no lo tape)
+        pie = tk.Frame(root, bg=self.FONDO)
+        pie.pack(side="bottom", fill="x", padx=8, pady=(2, 6))
+        tk.Button(pie, text="A−", command=lambda: self.cambiar_letra(-1), **estilo).pack(side="left")
+        tk.Button(pie, text="A+", command=lambda: self.cambiar_letra(+1), **estilo).pack(side="left", padx=(4, 12))
+        tk.Button(pie, text="Limpiar", command=self.limpiar, **estilo).pack(side="left")
+        tk.Button(pie, text="Guardar...", command=self.guardar, **estilo).pack(side="left", padx=4)
+        self.encima = tk.BooleanVar(value=self.config["siempre_encima"])
+        tk.Checkbutton(pie, text="Siempre encima", variable=self.encima, command=self._encima,
+                       bg=self.FONDO, fg=self.TEXTO, selectcolor="#2b2d31",
+                       activebackground=self.FONDO, activeforeground=self.TEXTO).pack(side="right")
+
+        # Fuentes con nombre: cambiar su tamaño actualiza todo el texto que las usa
+        self.letra = tkfont.Font(family="Segoe UI", size=self.config["tamano_letra"])
+        self.letra_hora = tkfont.Font(family="Segoe UI", size=max(8, self.config["tamano_letra"] - 4))
+        self.texto = tk.Text(root, wrap="word", font=self.letra, bg=self.FONDO, fg=self.TEXTO,
                              insertbackground=self.TEXTO, relief="flat", padx=12, pady=8)
         self.texto.pack(fill="both", expand=True)
         self.texto.tag_config("parcial", foreground=self.GRIS)
-        self.texto.tag_config("hora", foreground=self.ACENTO, font=("Segoe UI", 10))
+        self.texto.tag_config("hora", foreground=self.ACENTO, font=self.letra_hora)
+        self._aplicar_colores()
         self.texto.mark_set("parcial_ini", "1.0")
         self.texto.mark_gravity("parcial_ini", "left")
         self.texto.configure(state="disabled")
+        self.ajustes = None                 # Ventana de ajustes, si está abierta
 
         root.protocol("WM_DELETE_WINDOW", self.cerrar)
         self.timer_vram = None              # Liberar la VRAM tras LIBERAR_VRAM_TRAS detenido
@@ -835,6 +852,56 @@ class App:
         self.root.attributes("-topmost", self.encima.get())
         self.config["siempre_encima"] = self.encima.get()
         self.config.guardar()
+
+    # ---------- Letra y colores ----------
+    def cambiar_letra(self, delta=0, tamano=None):
+        tamano = tamano if tamano is not None else self.config["tamano_letra"] + delta
+        tamano = max(Configuracion.LETRA_MIN, min(Configuracion.LETRA_MAX, int(tamano)))
+        self.letra.configure(size=tamano)
+        self.letra_hora.configure(size=max(8, tamano - 4))
+        self.config["tamano_letra"] = tamano
+        self.config.guardar()
+        self.texto.see("end")
+
+    def _aplicar_colores(self):
+        """Etiqueta de color por hablante; un color inválido en la configuración vuelve al inicial."""
+        for fuente, clave in ((NOMBRE_YO, "color_yo"), (NOMBRE_OTROS, "color_otros")):
+            try:
+                self.root.winfo_rgb(self.config[clave])
+            except tk.TclError:
+                self.config[clave] = Configuracion.INICIAL[clave]
+            self.texto.tag_config(f"hablante_{fuente}", foreground=self.config[clave])
+
+    def elegir_color(self, clave, boton=None):
+        _, color = colorchooser.askcolor(self.config[clave], parent=self.ajustes or self.root,
+                                         title="Color de " + (NOMBRE_YO if clave == "color_yo" else NOMBRE_OTROS))
+        if color:
+            self.config[clave] = color
+            self.config.guardar()
+            self._aplicar_colores()
+            if boton is not None:
+                boton.configure(bg=color, activebackground=color)
+
+    def abrir_ajustes(self):
+        """Ventana de ajustes: los cambios se aplican y se guardan al instante."""
+        if self.ajustes is not None and self.ajustes.winfo_exists():
+            self.ajustes.lift()
+            return
+        v = self.ajustes = tk.Toplevel(self.root, bg=self.FONDO, padx=16, pady=12)
+        v.title("Ajustes")
+        v.resizable(False, False)
+        v.transient(self.root)
+        etiqueta = dict(bg=self.FONDO, fg=self.TEXTO, anchor="w")
+        tk.Label(v, text="Tamaño de letra", **etiqueta).grid(row=0, column=0, sticky="w", pady=4)
+        tamano = tk.IntVar(value=self.config["tamano_letra"])
+        tk.Spinbox(v, from_=Configuracion.LETRA_MIN, to=Configuracion.LETRA_MAX, width=5, textvariable=tamano,
+                   command=lambda: self.cambiar_letra(tamano=tamano.get())).grid(row=0, column=1, sticky="w")
+        for fila, (clave, nombre) in enumerate((("color_yo", NOMBRE_YO), ("color_otros", NOMBRE_OTROS)), start=1):
+            tk.Label(v, text=f"Color de «{nombre}»", **etiqueta).grid(row=fila, column=0, sticky="w", pady=4)
+            b = tk.Button(v, width=4, relief="flat", bg=self.config[clave], activebackground=self.config[clave])
+            b.configure(command=lambda c=clave, b=b: self.elegir_color(c, b))
+            b.grid(row=fila, column=1, sticky="w")
+        tk.Button(v, text="Cerrar", command=v.destroy, **self.estilo).grid(row=9, column=0, columnspan=2, pady=(12, 0))
 
     def limpiar(self):
         self.finales.clear()
@@ -945,7 +1012,7 @@ class App:
         self.texto.delete("parcial_ini", "end-1c")   # "end" borraría también el último salto de línea
         linea = pos + 1                     # Cada frase final ocupa una línea del texto
         self.texto.insert(f"{linea}.0", f"{hora}  ", "hora")
-        self.texto.insert(f"{linea}.{len(hora) + 2}", f"{fuente}: {s}\n")
+        self.texto.insert(f"{linea}.{len(hora) + 2}", f"{fuente}: {s}\n", f"hablante_{fuente}")
         self.texto.mark_set("parcial_ini", "end-1c")
         self.texto.configure(state="disabled")
         self._mostrar_parciales()           # Parciales de otras fuentes, debajo del final
