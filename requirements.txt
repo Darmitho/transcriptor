@@ -4,3 +4,4 @@ numpy
 scipy
 nvidia-cublas-cu12
 nvidia-cudnn-cu12==9.*
+sentencepiece

@@ -2,5 +2,4 @@
 -r requirements.txt
 psutil
 nvidia-ml-py
-sentencepiece
 sacrebleu

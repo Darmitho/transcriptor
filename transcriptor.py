@@ -77,6 +77,14 @@ SOSP_VOZ_MIN = 0.3              # Sospechosa, sola en la frase, con menos voz qu
 # resultado que hotwords o un prompt descriptivo. Mantener la lista corta. () = sin contexto.
 VOCABULARIO = ("Claude", "CriptoBuzz", "pullback", "order block", "RSI")
 
+# --- Traducción inglés -> español de las frases finales (opcional) ---
+# Opus-MT en-es (Apache-2.0) sobre CTranslate2, en CPU para no quitarle GPU a Whisper.
+# Se convierte una vez con tools\convertir_traduccion.md y luego funciona sin red.
+MODELO_TRADUCCION = os.path.join(os.path.expanduser("~"), ".cache", "transcriptor", "traduccion", "opus-mt-en-es")
+TRADUCCION_HILOS = 4                # Núcleos de CPU para traducir (~0.1 s por frase)
+# Términos que quedan en inglés al traducir, además de los de VOCABULARIO
+NO_TRADUCIR = ("stop loss",)
+
 # Carpeta local (fuera de OneDrive) donde se guardan las transcripciones automáticas
 CARPETA_SALIDA = os.path.expandvars(r"%USERPROFILE%\Documents\Transcripciones")
 # True = nunca conectarse a Hugging Face (el modelo debe estar ya descargado).
@@ -145,6 +153,27 @@ def _prompt_vocabulario(vocabulario, idioma):
     frase, y = PLANTILLAS_PROMPT[idioma]
     lista = ", ".join(vocabulario[:-1]) + y + vocabulario[-1] if len(vocabulario) > 1 else vocabulario[0]
     return frase.format(lista)
+
+
+def _proteger_terminos(texto, terminos):
+    """Cambia cada término por un marcador (__0__, __1__...) que el traductor deja tal cual.
+    Devuelve el texto marcado y los términos en el orden de sus marcadores."""
+    if not terminos:
+        return texto, []
+    patron = re.compile(r"\b(" + "|".join(re.escape(t) for t in sorted(terminos, key=len, reverse=True)) + r")\b",
+                        re.IGNORECASE)
+    usados = []
+    marcado = patron.sub(lambda m: (usados.append(m.group(0)), f"__{len(usados) - 1}__")[1], texto)
+    return marcado, usados
+
+
+def _restaurar_terminos(traduccion, usados):
+    """Vuelve a poner los términos. None si el traductor deformó algún marcador."""
+    for i, termino in enumerate(usados):
+        if f"__{i}__" not in traduccion:
+            return None
+        traduccion = traduccion.replace(f"__{i}__", termino)
+    return traduccion
 
 
 def _quitar_solape(previo, nuevo):
@@ -659,6 +688,72 @@ class Motor:
             for f in fuentes:
                 f.resumen()
             self.cola_ui.put(("detenido", None))
+
+
+class Traductor(threading.Thread):
+    """Traduce frases finales inglés -> español en su propio hilo, en CPU, sin frenar la
+    transcripción. pedir(clave, texto) encola; el resultado llega a la ventana como
+    ("traduccion", (clave, texto_es)). Si el modelo no está: ("error_traduccion", mensaje)."""
+
+    def __init__(self, cola_ui, ruta=None):
+        super().__init__(daemon=True)
+        self.cola_ui = cola_ui
+        self.ruta = ruta or MODELO_TRADUCCION
+        self.pendientes = queue.Queue()
+        self.listo = threading.Event()      # Se marca al terminar de cargar, haya funcionado o no
+        self.error = None
+        self.terminos = tuple(VOCABULARIO) + tuple(NO_TRADUCIR)
+
+    def run(self):
+        try:
+            import ctranslate2
+            import sentencepiece as spm
+            t0 = time.perf_counter()
+            self.modelo = ctranslate2.Translator(self.ruta, device="cpu", compute_type="int8",
+                                                 inter_threads=1, intra_threads=TRADUCCION_HILOS)
+            self.sp_origen = spm.SentencePieceProcessor(model_file=os.path.join(self.ruta, "source.spm"))
+            self.sp_destino = spm.SentencePieceProcessor(model_file=os.path.join(self.ruta, "target.spm"))
+            log.info("traductor cargado en %.1f s", time.perf_counter() - t0)
+        except Exception as e:
+            self.error = (f"No se pudo cargar el modelo de traducción ({e}).\n\n"
+                          f"Se convierte una vez siguiendo tools\\convertir_traduccion.md y queda en:\n{self.ruta}")
+            log.error("Traductor: %s", e)
+            self.cola_ui.put(("error_traduccion", self.error))
+            self.listo.set()
+            return
+        self.listo.set()
+        while True:
+            clave, texto = self.pendientes.get()
+            if clave is None:
+                break
+            try:
+                t0 = time.perf_counter()
+                traduccion = self.traducir(texto)
+                # Solo métricas, nunca el texto (puede ser información de clientes)
+                log.info("traducción %4.0f ms, %d palabras", (time.perf_counter() - t0) * 1000, len(texto.split()))
+                self.cola_ui.put(("traduccion", (clave, traduccion)))
+            except Exception as e:
+                log.error("Error al traducir: %s", e)
+
+    def _traducir_tal_cual(self, texto):
+        piezas = self.sp_origen.encode(texto, out_type=str) + ["</s>"]
+        r = self.modelo.translate_batch([piezas], beam_size=4)
+        return self.sp_destino.decode(r[0].hypotheses[0])
+
+    def traducir(self, texto):
+        """Con los términos protegidos; si el modelo deformó algún marcador, sin protegerlos."""
+        marcado, usados = _proteger_terminos(texto, self.terminos)
+        if usados:
+            restaurado = _restaurar_terminos(self._traducir_tal_cual(marcado), usados)
+            if restaurado is not None:
+                return restaurado
+        return self._traducir_tal_cual(texto)
+
+    def pedir(self, clave, texto):
+        self.pendientes.put((clave, texto))
+
+    def detener(self):
+        self.pendientes.put((None, None))
 
 
 class Configuracion(dict):

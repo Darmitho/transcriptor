@@ -107,6 +107,54 @@ def pruebas_unitarias(motor):
     return len(casos) + len(otros), fallos
 
 
+UMBRAL_CHRF_TRADUCCION = 79.5           # Medido: 80.5 con términos protegidos (78.3 sin proteger)
+
+
+def pruebas_traduccion():
+    """Protección de términos (sin modelo) y traductor real: calidad, términos intactos y
+    velocidad. Sin el modelo instalado se omite con aviso (se convierte aparte, no está en el repo)."""
+    import os
+    import queue as q
+    import statistics
+    fallos = []
+    marcado, usados = T._proteger_terminos("My Stop Loss and the RSI near the order block, not RSIS",
+                                           ("stop loss", "RSI", "order block"))
+    if marcado != "My __0__ and the __1__ near the __2__, not RSIS" or usados != ["Stop Loss", "RSI", "order block"]:
+        fallos.append(("proteger", marcado, usados))
+    if T._restaurar_terminos("Mi __0__ y el __1__", ["stop loss", "RSI"]) != "Mi stop loss y el RSI" or \
+            T._restaurar_terminos("Mi stop y el __1__", ["stop loss", "RSI"]) is not None:
+        fallos.append(("restaurar",))
+    if not os.path.isdir(T.MODELO_TRADUCCION):
+        print(f"  AVISO: pruebas del traductor omitidas, falta el modelo en {T.MODELO_TRADUCCION}")
+        return 2, fallos
+
+    import sacrebleu
+    from comun import RAIZ
+    with open(os.path.join(RAIZ, "tests", "traduccion_en_es.tsv"), encoding="utf-8") as f:
+        pares = [l.rstrip("\n").split("\t") for l in f if l.strip()]
+    tr = T.Traductor(q.Queue())
+    tr.start()
+    tr.listo.wait(60)
+    if tr.error:
+        return 3, fallos + [("cargar traductor", tr.error)]
+    tiempos, salidas = [], []
+    for en, _ in pares:
+        t0 = time.perf_counter()
+        salidas.append(tr.traducir(en))
+        tiempos.append(time.perf_counter() - t0)
+    tr.detener()
+    chrf = sacrebleu.corpus_chrf(salidas, [[es for _, es in pares]]).score
+    terminos = [(en, es) for (en, _), es in zip(pares, salidas) if T._proteger_terminos(en, tr.terminos)[1]]
+    perdidos = [(en, es) for en, es in terminos
+                if any(t.lower() not in es.lower() for t in T._proteger_terminos(en, tr.terminos)[1])]
+    mediana = statistics.median(tiempos) * 1000
+    print(f"  traducción: chrF {chrf:.1f} (mín. {UMBRAL_CHRF_TRADUCCION}) | {len(terminos)} frases con términos, "
+          f"{len(perdidos)} los perdieron | {mediana:.0f} ms por frase")
+    if chrf < UMBRAL_CHRF_TRADUCCION or perdidos or mediana > 300:
+        fallos.append(("traductor", round(chrf, 1), perdidos, round(mediana)))
+    return 3, fallos
+
+
 def prueba_recarga(motor, velocidad):
     """Liberar la VRAM baja el uso de la GPU, y al volver a escuchar el modelo se recarga
     sin perder la frase que empezó durante la recarga."""
@@ -140,6 +188,9 @@ def main():
     n_unit, f_unit = pruebas_unitarias(motor)
     fallos_unit += f_unit
     n_unit += n_ventana
+    n_trad, f_trad = pruebas_traduccion()
+    n_unit += n_trad
+    fallos_unit += f_trad
     print(f"\nunitarias: {n_unit - len(fallos_unit)}/{n_unit} OK")
     for f in fallos_unit:
         print("  FALLO:", f)
