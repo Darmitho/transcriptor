@@ -91,7 +91,10 @@ def alimentar(pistas, fuentes, cola, velocidad=1.0, fines_voz=None):
     for i in range(0, largo, paso):
         for n, a in pistas.items():
             if i < len(a):
-                cola.put((fuentes[n], a[i:i + paso], time.time()))   # Como el callback: trozo e inicio
+                trozo = a[i:i + paso]
+                f = fuentes[n]           # Lo mismo que hace el callback de audio
+                f.nivel, f.t_nivel = float(np.sqrt(np.mean(trozo * trozo))), time.time()
+                cola.put((f, trozo, time.time()))
             while pendientes.get(n) and pendientes[n][0] <= i + paso:
                 pendientes[n].pop(0)
                 enviados[n].append(time.perf_counter())

@@ -130,10 +130,16 @@ class Medicion:
             fuentes = {n: T.Fuente(n, DISP, m.cola_audio) for n in pistas}
             m.fuentes = list(fuentes.values())
             m.hilo = threading.Thread(target=m._bucle, args=(m.stop, m.cola_audio, m.fuentes), daemon=True)
+            # Medidores e indicador funcionando, como en uso real. Igual que el botón Iniciar:
+            # solo después de que la ventana procesó el "detenido" del escenario anterior
+            while not self.app.cola_ui.empty():
+                time.sleep(0.05)
+            self.app.activo = True
             m.hilo.start()
             esperado = max(len(a) for a in pistas.values()) / 48000 + 3.0
             enviados = alimentar(pistas, fuentes, m.cola_audio, fines_voz=fines)
             time.sleep(3.0)             # Margen para que lleguen los últimos finales
+            self.app.activo = False         # Como el botón Detener: primero la ventana, luego el motor
             m.stop.set()
             m.hilo.join(120)
         r = self.mu.resultado()

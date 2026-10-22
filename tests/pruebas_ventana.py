@@ -178,7 +178,61 @@ def letra_y_colores():
     return fallos
 
 
-PRUEBAS = [orden_cronologico, timer_vram, configuracion, letra_y_colores]
+def medidores_y_estado():
+    """Barras según el nivel de cada fuente (vacías si no hay audio reciente o si la fuente
+    no existe) y estado: Detenido, Escuchando, Transcribiendo, Atrasado, Error."""
+    from types import SimpleNamespace
+    fallos = []
+    with app_aislada():
+        root = tk.Tk()
+        app = T.App(root)
+        ancho = lambda n: (lambda c: c[2] - c[0])(app.medidores.coords(app.barras[n][0]))
+        estado = lambda: (app.texto_estado.cget("text").split(" ·")[0], app.punto_estado.cget("fg"))
+
+        app._actualizar_indicadores()
+        if estado() != ("Detenido", app.GRIS):
+            fallos.append(("detenido", estado()))
+
+        ahora = time.time()
+        otros = SimpleNamespace(nombre="Otros", retirar=False, nivel=0.1, t_nivel=ahora)    # -20 dBFS
+        app.motor.fuentes = [otros]          # Sin micrófono: la barra de "Yo" queda vacía
+        app.activo = True
+        app.motor.atraso = lambda: 0.2
+        app._actualizar_indicadores()
+        esperado = (60 - 20) / 60 * (app.ANCHO_MEDIDOR - 2)
+        if abs(ancho("Otros") - esperado) > 1 or ancho("Yo") != 0:
+            fallos.append(("barras", ancho("Otros"), esperado, ancho("Yo")))
+        if estado() != ("Escuchando", app.VERDE) or "atraso 0.2 s" not in app.texto_estado.cget("text"):
+            fallos.append(("escuchando", app.texto_estado.cget("text")))
+
+        otros.t_nivel = ahora - 5            # Sin audio reciente (WASAPI calla en silencio): cae
+        antes = ancho("Otros")
+        app._actualizar_indicadores()
+        if not (0 < ancho("Otros") < antes):
+            fallos.append(("caída suave", antes, ancho("Otros")))
+        for _ in range(15):
+            app._actualizar_indicadores()
+        if ancho("Otros") != 0:
+            fallos.append(("cae a cero", ancho("Otros")))
+
+        app.motor.transcribiendo = True
+        app._actualizar_indicadores()
+        t = estado()
+        app.motor.atraso = lambda: 2.5
+        app._actualizar_indicadores()
+        a = estado()
+        app.cola_ui.put(("estado", "Error: algo falló"))
+        app._procesar_cola()
+        app._actualizar_indicadores()
+        e = estado()
+        if (t, a, e) != (("Transcribiendo", app.ACENTO), ("Atrasado", app.AMARILLO), ("Error", app.ROJO)):
+            fallos.append(("estados", t, a, e))
+        app.activo = False
+        root.destroy()
+    return fallos
+
+
+PRUEBAS = [orden_cronologico, timer_vram, configuracion, letra_y_colores, medidores_y_estado]
 
 
 def todas():

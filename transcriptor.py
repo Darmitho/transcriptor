@@ -20,7 +20,7 @@ import json
 import datetime
 import unicodedata
 from collections import Counter, deque
-from math import gcd
+from math import gcd, log10
 
 
 # ======================= CONFIGURACIÓN =======================
@@ -213,6 +213,7 @@ class Fuente:
         self.ultimo_audio = self.ultimo_parcial = time.time()
         self.stats = Counter()
         self.retirar = False                # El hilo del Motor la cierra y la quita de la lista
+        self.nivel, self.t_nivel = 0.0, 0.0  # RMS del último trozo capturado y cuándo, para el medidor
 
     # ---------- Captura ----------
     def abrir(self, pa):
@@ -230,6 +231,9 @@ class Fuente:
     def _callback(self, in_data, frame_count, time_info, status):
         x = np.frombuffer(in_data, dtype=np.float32).reshape(-1, self.canales).mean(axis=1)
         # El callback llega cuando el bloque terminó de capturarse: su inicio fue antes
+        # El nivel se mide aquí y no en el hilo del Motor: así el medidor no se congela
+        # mientras la GPU transcribe
+        self.nivel, self.t_nivel = float(np.sqrt(np.mean(x * x))), time.time()
         self.cola.put((self, x.copy(), time.time() - frame_count / self.tasa))
         return (None, pyaudio.paContinue)
 
@@ -306,7 +310,12 @@ class Motor:
         self.fuentes = []
         self.hilo = None
         self.vram_liberada = False          # Modelo fuera de la GPU: se recarga al iniciar
+        self.transcribiendo = False         # Whisper está procesando ahora mismo
         self.cambiar_idioma(IDIOMA)
+
+    def atraso(self):
+        """Segundos de audio por fuente esperando en la cola."""
+        return self.cola_audio.qsize() / max(1, len(self.fuentes)) * TROZO
 
     def cambiar_idioma(self, idioma):
         """Se puede llamar en marcha desde la UI: aplica desde la próxima transcripción.
@@ -480,19 +489,23 @@ class Motor:
         idioma, prompt = self.contexto
         audio = np.concatenate(trozos)
         audio = resample_poly(audio, fuente.up, fuente.down).astype(np.float32)
-        segmentos, _ = self.modelo.transcribe(
-            audio,
-            language=idioma,
-            beam_size=5 if final else 1,
-            vad_filter=False,               # El VAD propio ya decidió que hay voz
-            condition_on_previous_text=False,
-            # word_timestamps junto con without_timestamps hace que Whisper siga
-            # transcribiendo la cola de silencio (alucina "Gracias..."): no combinarlos
-            without_timestamps=not palabras,
-            word_timestamps=palabras,
-            initial_prompt=prompt,
-        )
-        segmentos = list(segmentos)
+        self.transcribiendo = True          # Para el indicador de estado de la ventana
+        try:
+            segmentos, _ = self.modelo.transcribe(
+                audio,
+                language=idioma,
+                beam_size=5 if final else 1,
+                vad_filter=False,           # El VAD propio ya decidió que hay voz
+                condition_on_previous_text=False,
+                # word_timestamps junto con without_timestamps hace que Whisper siga
+                # transcribiendo la cola de silencio (alucina "Gracias..."): no combinarlos
+                without_timestamps=not palabras,
+                word_timestamps=palabras,
+                initial_prompt=prompt,
+            )
+            segmentos = list(segmentos)     # La transcripción ocurre al recorrer el generador
+        finally:
+            self.transcribiendo = False
         conservados, descartes = [], Counter()
         for s in segmentos:
             motivo = self._motivo_descarte(s, len(segmentos), voz_seg, prompt)
@@ -703,6 +716,10 @@ def _geometria_visible(geometria):
 
 class App:
     FONDO, TEXTO, GRIS, ACENTO = "#1e1f22", "#e8e8e8", "#8a8d93", "#6ea8fe"
+    VERDE, AMARILLO, ROJO = "#5cc98a", "#e5c07b", "#e06c75"
+    ANCHO_MEDIDOR = 160                 # Píxeles de cada barra de nivel
+    ATRASO_AVISO = 1.0                  # Segundos de atraso de la cola que ponen el estado en amarillo
+    NIVEL_VIGENTE = 0.3                 # Un nivel más viejo que esto cuenta como silencio
 
     def __init__(self, root):
         self.root = root
@@ -757,6 +774,24 @@ class App:
         self.estado = tk.Label(barra, text="", bg=self.FONDO, fg=self.GRIS, anchor="e")
         self.estado.pack(side="right", fill="x", expand=True)
 
+        # Medidores de nivel por fuente (confirman que entra audio) e indicador de estado
+        fila = tk.Frame(root, bg=self.FONDO)
+        fila.pack(fill="x", padx=12, pady=(2, 0))
+        self.medidores = tk.Canvas(fila, height=22, width=2 * (60 + self.ANCHO_MEDIDOR) + 20,
+                                   bg=self.FONDO, highlightthickness=0)
+        self.medidores.pack(side="left")
+        self.barras = {}                    # fuente -> [id de la barra, fracción mostrada]
+        for i, nombre in enumerate((NOMBRE_OTROS, NOMBRE_YO)):
+            x = i * (60 + self.ANCHO_MEDIDOR + 20)
+            self.medidores.create_text(x, 11, text=nombre, anchor="w", fill=self.GRIS)
+            self.medidores.create_rectangle(x + 52, 5, x + 52 + self.ANCHO_MEDIDOR, 17, outline="#3a3d43")
+            self.barras[nombre] = [self.medidores.create_rectangle(x + 53, 6, x + 53, 17, width=0), 0.0]
+        self.texto_estado = tk.Label(fila, text="Detenido", bg=self.FONDO, fg=self.GRIS)
+        self.texto_estado.pack(side="right")
+        self.punto_estado = tk.Label(fila, text="●", bg=self.FONDO, fg=self.GRIS, font=("Segoe UI", 13))
+        self.punto_estado.pack(side="right")
+        self.hay_error = False
+
         # Abajo: lo que afecta al texto (se empaqueta antes que el texto para que no lo tape)
         pie = tk.Frame(root, bg=self.FONDO)
         pie.pack(side="bottom", fill="x", padx=8, pady=(2, 6))
@@ -798,6 +833,7 @@ class App:
             self.motor.detener()
         else:
             self._cancelar_timer_vram()
+            self.hay_error = False
             try:
                 self.motor.iniciar(con_mic=self.mic.get())
             except Exception as e:
@@ -871,6 +907,7 @@ class App:
             except tk.TclError:
                 self.config[clave] = Configuracion.INICIAL[clave]
             self.texto.tag_config(f"hablante_{fuente}", foreground=self.config[clave])
+            self.medidores.itemconfigure(self.barras[fuente][0], fill=self.config[clave])
 
     def elegir_color(self, clave, boton=None):
         _, color = colorchooser.askcolor(self.config[clave], parent=self.ajustes or self.root,
@@ -947,7 +984,43 @@ class App:
     def revisar_cola(self):
         self._procesar_cola()
         if not self.destruida:
+            self._actualizar_indicadores()  # Mismo sondeo de 100 ms: sin temporizador aparte
             self.root.after(100, self.revisar_cola)
+
+    def _actualizar_indicadores(self):
+        """Medidores de nivel y estado. Solo toca la ventana cuando algo cambió."""
+        ahora = time.time()
+        fuentes = {f.nombre: f for f in self.motor.fuentes if not f.retirar} if self.activo else {}
+        for nombre, item in self.barras.items():
+            barra, mostrado = item
+            f = fuentes.get(nombre)
+            objetivo = 0.0
+            if f is not None and ahora - f.t_nivel < self.NIVEL_VIGENTE:
+                # De -60 dBFS (vacío) a 0 dBFS (lleno): la voz normal queda a media barra
+                objetivo = min(1.0, max(0.0, (20 * log10(max(f.nivel, 1e-6)) + 60) / 60))
+            nuevo = max(objetivo, mostrado - 0.1)   # Caída suave, como un vúmetro
+            if abs(nuevo - mostrado) > 0.01:
+                x0, y0, _, y1 = self.medidores.coords(barra)
+                self.medidores.coords(barra, x0, y0, x0 + nuevo * (self.ANCHO_MEDIDOR - 2), y1)
+                item[1] = nuevo
+
+        if not self.activo:
+            estado, color = ("Error", self.ROJO) if self.hay_error else ("Detenido", self.GRIS)
+        else:
+            atraso = self.motor.atraso()
+            if self.hay_error:
+                estado, color = "Error", self.ROJO
+            elif atraso > self.ATRASO_AVISO:
+                estado, color = "Atrasado", self.AMARILLO
+            elif self.motor.transcribiendo:
+                estado, color = "Transcribiendo", self.ACENTO
+            else:
+                estado, color = "Escuchando", self.VERDE
+            estado += f" · atraso {atraso:.1f} s"
+        if self.texto_estado.cget("text") != estado:
+            self.texto_estado.configure(text=estado)
+        if self.punto_estado.cget("fg") != color:
+            self.punto_estado.configure(fg=color)
 
     def _procesar_cola(self):
         try:
@@ -955,6 +1028,7 @@ class App:
                 tipo, valor = self.cola_ui.get_nowait()
                 if tipo == "estado":
                     self.estado.configure(text=valor)
+                    self.hay_error = valor.startswith("Error")
                 elif tipo == "modelo_listo":
                     self.btn.configure(state="normal")
                     self._programar_liberar_vram()
@@ -971,6 +1045,7 @@ class App:
                         self._destruir()
                     else:
                         error = self.activo     # El hilo terminó solo: no pudo recargar el modelo
+                        self.hay_error = error
                         if error:
                             self.activo = False
                             self.motor.detener()
