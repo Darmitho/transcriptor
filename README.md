@@ -10,6 +10,7 @@ en la GPU: el audio y el texto nunca salen del equipo.
 - Modo subtítulos: una franja semitransparente siempre encima que deja pasar los clics.
 - Detección de voz con Silero VAD y filtros contra las alucinaciones típicas de Whisper en silencio.
 - Español e inglés, vocabulario propio (nombres, jerga) y configuración que se recuerda entre sesiones.
+- Traducción en vivo del inglés al español (opcional, en CPU), con tu vocabulario sin traducir.
 
 ## Requisitos
 
@@ -45,6 +46,10 @@ primera vez hay que permitir la descarga del modelo, una sola vez:
    El modelo (~1.6 GB) queda en `%USERPROFILE%\.cache\huggingface`.
 3. Vuelve a poner `MODO_OFFLINE = True`.
 
+**Para la traducción (opcional):** el modelo Opus-MT en-es (Apache-2.0, 79 MB) se convierte una vez
+a CTranslate2 siguiendo [tools/convertir_traduccion.md](tools/convertir_traduccion.md). Queda en
+`%USERPROFILE%\.cache\transcriptor\traduccion` y luego funciona sin red.
+
 ## Uso
 
 ```powershell
@@ -68,7 +73,8 @@ Conviene ejecutarlo desde una terminal: ahí aparecen las métricas de cada tran
 | ▶ Iniciar / ■ Detener | Empieza o detiene la captura; al detener se transcribe la frase en curso |
 | 🎤 Micrófono | Agrega o quita tu micrófono, también con la captura en marcha. Siempre arranca apagado |
 | 🔄 Reconectar | Toma los dispositivos predeterminados actuales de Windows (tras conectar audífonos) |
-| Español / English | Idioma que se habla en el audio (no traduce); aplica desde la frase siguiente |
+| Español / English | Idioma que se habla en el audio; aplica desde la frase siguiente |
+| Sin traducir / Original + traducción / Solo traducción | Traduce al español las frases finales cuando el idioma es English. La traducción aparece ~0.3 s después del texto, en cursiva debajo del original o en su lugar; la franja de subtítulos sigue la misma vista |
 | CC Subtítulos | Alterna entre la ventana y la franja de subtítulos |
 | ⚙ | Ajustes: letra y colores de la ventana; tamaño, líneas, opacidad y posición de la franja |
 | Medidores Otros / Yo | Nivel de audio de cada fuente, para confirmar que entra sonido |
@@ -103,7 +109,8 @@ Ninguna de estas carpetas está dentro de OneDrive. Si `CARPETA_SALIDA` apunta a
 de OneDrive, la consola lo advierte: las transcripciones se sincronizarían a la nube.
 
 Cada línea del `.txt` tiene la forma `[10:32:05] Otros: texto`, con la hora en que empezó a
-hablarse la frase.
+hablarse la frase. Con la traducción activa, cada frase lleva debajo su versión en español:
+`[10:32:05] Otros (es): texto traducido`.
 
 ## Configuración
 
@@ -120,6 +127,8 @@ hablarse la frase.
 | `SILENCIO_FIN` | `1.0` | Silencio que cierra una frase. Más bajo = texto final antes, pero frases más cortadas |
 | `MODELO` | `"large-v3-turbo"` | `"medium"` o `"small"` si la GPU no da abasto |
 | `MODO_OFFLINE` | `True` | Sin conexión a internet (ver [Primera vez](#primera-vez-descargar-el-modelo)) |
+| `NO_TRADUCIR` | `("stop loss",)` | Términos que quedan en inglés al traducir, además de los de `VOCABULARIO` |
+| `TRADUCCION_HILOS` | `1` | Núcleos para traducir. Con 4 la traducción llega ~0.1 s antes pero gasta ~5 veces más CPU |
 
 ## Consumo de referencia
 
@@ -132,6 +141,9 @@ Medido en una RTX 3050 Laptop (4 GB) con `tools\medir_recursos.py`:
 | VRAM | ~1 GB (~85 MB tras 5 min detenido) | ~1.1 GB | ~1.1 GB |
 | Latencia: fin del habla a texto final | | ~1.7 s | ~1.9 s |
 
+La traducción suma ~100 MB de RAM, nada de VRAM y casi nada de CPU (44 → 46 % de un núcleo con
+audio en inglés), y aparece ~0.3 s después del texto original.
+
 Si otro programa usa la GPU al mismo tiempo, la latencia puede duplicarse.
 
 ## Solución de problemas
@@ -142,6 +154,8 @@ Si otro programa usa la GPU al mismo tiempo, la latencia puede duplicarse.
 | En reuniones no se transcribe a los demás | Teams o Zoom usan otro dispositivo que el predeterminado de Windows: deja ambos iguales |
 | Tu voz aparece también como "Otros" | Estás usando parlantes: el micrófono y la salida se mezclan. Usa audífonos |
 | "No se pudo cargar ningún modelo" | Falta descargar el modelo: ver [Primera vez](#primera-vez-descargar-el-modelo) |
+| "No se pudo cargar el modelo de traducción" | Falta convertirlo una vez: ver [tools/convertir_traduccion.md](tools/convertir_traduccion.md) |
+| No aparece la traducción | El selector de idioma debe estar en **English**: solo se traduce el audio en inglés |
 | "GPU no disponible, usando CPU" | Falla CUDA (driver viejo o GPU no NVIDIA). El respaldo en CPU usa el modelo `small`, que también hay que descargar una vez con `MODO_OFFLINE = False` |
 | Estado en amarillo ("Atrasado") seguido | La GPU no da abasto: cierra otros programas que la usen o prueba `MODELO = "medium"` |
 | Ctrl+Shift+S no hace nada fuera de la ventana | Otra app ocupa el atajo (Ajustes dice "no disponible"): cámbialo en `atajo_subtitulos` |
