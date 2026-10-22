@@ -4,3 +4,5 @@ __pycache__/
 # Transcripciones: pueden contener información de clientes
 transcripcion_*.txt
 .claude/settings.local.json
+# Salida de tests/generar_audio.ps1 (los .wav del repo están en tests/audio a 16 kHz)
+tests/audio_48k/

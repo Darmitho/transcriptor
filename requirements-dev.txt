@@ -1,0 +1,4 @@
+# Solo para pruebas y medición (no las necesita la app)
+-r requirements.txt
+psutil
+nvidia-ml-py
