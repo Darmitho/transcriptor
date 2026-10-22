@@ -8,6 +8,7 @@ y pasa a blanco cuando la frase termina.
 """
 
 import os
+import re
 import sys
 import glob
 import queue
@@ -15,6 +16,8 @@ import logging
 import threading
 import time
 import datetime
+import unicodedata
+from collections import Counter, deque
 from math import gcd
 
 
@@ -26,21 +29,41 @@ IDIOMA = "es"                   # None = detección automática
 SR_MODELO = 16000
 
 INTERVALO_PARCIAL = 1.0         # Cada cuántos segundos se refresca el texto provisional
-SILENCIO_FIN = 0.7              # Segundos de silencio que cierran una frase
+SILENCIO_FIN = 0.7              # Segundos sin voz (según el VAD) que cierran una frase
 MAX_FRASE = 12.0                # Corte forzado de frases largas (segundos)
-UMBRAL_RMS = 0.006              # Nivel mínimo para considerar que hay voz
+TROZO = 0.1                     # Duración de cada bloque de audio capturado (segundos)
+
+# --- Detección de voz (Silero VAD, incluido en faster-whisper, corre en CPU) ---
+VAD_UMBRAL = 0.5                # Probabilidad para considerar que empieza la voz
+VAD_UMBRAL_FIN = 0.35           # Una vez en voz, sigue siéndolo mientras supere este valor
+VOZ_MIN = 0.25                  # Segundos de voz mínimos para llamar a Whisper
+PRE_ROLL = 0.3                  # Audio previo al inicio de la voz que se conserva
+RECORTE = 0.3                   # Margen de silencio que se deja al inicio y fin de la frase
+
+# --- Filtros por segmento contra alucinaciones ---
+MAX_COMPRESION = 2.4            # compression_ratio mayor = texto repetitivo en bucle
+MAX_NO_VOZ = 0.8                # no_speech_prob mayor = el modelo cree que no hay voz
+MIN_LOGPROB = -1.0              # avg_logprob menor = confianza muy baja
+# Frases típicas de alucinación: solo se descartan si además hay señales de duda
+FRASES_SOSPECHOSAS = (
+    "gracias",
+    "muchas gracias",
+    "gracias por ver el video",
+    "suscribete",
+    "subtitulos realizados por la comunidad de amara org",
+    "musica",
+)
+SOSP_LOGPROB = -0.5             # Sospechosa con avg_logprob menor: se descarta
+SOSP_NO_VOZ = 0.3               # Sospechosa con no_speech_prob mayor: se descarta
+SOSP_VOZ_MIN = 0.3              # Sospechosa, sola en la frase, con menos voz que esto: se descarta
+
+PROMPT_FIJO = None              # Ej.: "Hola. Esta es una conversación, con puntuación." (None = sin prompt)
 
 # Carpeta local (fuera de OneDrive) donde se guardan las transcripciones automáticas
 CARPETA_SALIDA = os.path.expandvars(r"%USERPROFILE%\Documents\Transcripciones")
 # True = nunca conectarse a Hugging Face (el modelo debe estar ya descargado).
 # Poner False solo una vez si hace falta descargar un modelo nuevo.
 MODO_OFFLINE = True
-
-ALUCINACIONES = (
-    "subtítulos realizados por la comunidad de amara.org",
-    "gracias por ver el video",
-    "suscríbete",
-)
 # =============================================================
 
 if MODO_OFFLINE:
@@ -73,8 +96,49 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 from scipy.signal import resample_poly
 from faster_whisper import WhisperModel
+from faster_whisper.vad import get_vad_model
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+
+def _normalizar(texto):
+    """Minúsculas, sin tildes ni puntuación: '¡Gracias!' -> 'gracias'."""
+    t = unicodedata.normalize("NFD", texto.lower())
+    t = "".join(c for c in t if unicodedata.category(c) != "Mn")
+    return " ".join(re.sub(r"[^\w\s]", " ", t).split())
+
+
+class DetectorVoz:
+    """Silero VAD incremental: cuántos segundos de cada bloque de audio son voz."""
+    VENTANA = 512                   # Muestras a 16 kHz (32 ms) que evalúa Silero
+
+    def __init__(self, up, down):
+        self.modelo = get_vad_model()
+        self.up, self.down = up, down
+        self.resto = np.zeros(0, np.float32)
+        self.previa = np.zeros(self.VENTANA, np.float32)  # Da contexto a la primera ventana
+        self.en_voz = False
+        self.t_vad = self.t_audio = 0.0
+
+    def segundos_voz(self, x):
+        t0 = time.perf_counter()
+        y = np.concatenate([self.resto, resample_poly(x, self.up, self.down).astype(np.float32)])
+        n = len(y) // self.VENTANA * self.VENTANA
+        self.resto = y[n:]
+        ventanas_voz = 0
+        if n:
+            # La primera probabilidad corresponde a la ventana previa (ya evaluada): se ignora
+            probs = self.modelo(np.concatenate([self.previa, y[:n]]))[1:]
+            self.previa = y[n - self.VENTANA:n]
+            for p in probs:   # Histéresis: cuesta más entrar en voz que mantenerse
+                self.en_voz = p >= (VAD_UMBRAL_FIN if self.en_voz else VAD_UMBRAL)
+                ventanas_voz += self.en_voz
+        self.t_vad += time.perf_counter() - t0
+        self.t_audio += len(x) / (SR_MODELO * self.down / self.up)
+        return ventanas_voz * self.VENTANA / SR_MODELO
+
+    def ms_por_segundo(self):
+        return 1000 * self.t_vad / max(self.t_audio, 1e-6)
 
 
 class Motor:
@@ -89,7 +153,6 @@ class Motor:
         self.stream = None
         self.hilo = None
         self.tasa = 48000
-        self.contexto = ""
 
     # ---------- Modelo ----------
     def cargar_modelo(self):
@@ -139,7 +202,6 @@ class Motor:
         # Cola y evento nuevos por sesión: nada de una sesión anterior se mezcla con esta
         self.stop = threading.Event()
         self.cola_audio = queue.Queue()
-        self.contexto = ""
         self.pa = pyaudio.PyAudio()
         try:
             disp = self._dispositivo_loopback()
@@ -153,7 +215,7 @@ class Motor:
                 rate=self.tasa,
                 input=True,
                 input_device_index=disp["index"],
-                frames_per_buffer=int(self.tasa * 0.1),
+                frames_per_buffer=int(self.tasa * TROZO),
                 stream_callback=self._callback,
             )
             self.stream.start_stream()
@@ -181,7 +243,21 @@ class Motor:
         self.cola_ui.put(("estado", "Deteniendo..."))
 
     # ---------- Transcripción ----------
-    def _transcribir(self, trozos, final):
+    def _motivo_descarte(self, s, n_segs, voz_seg):
+        """Devuelve por qué se descarta un segmento de Whisper, o None si se conserva."""
+        if s.compression_ratio > MAX_COMPRESION:
+            return "compresion"
+        if s.no_speech_prob > MAX_NO_VOZ:
+            return "no_voz"
+        if s.avg_logprob < MIN_LOGPROB:
+            return "logprob"
+        if _normalizar(s.text) in FRASES_SOSPECHOSAS and (
+                s.avg_logprob < SOSP_LOGPROB or s.no_speech_prob > SOSP_NO_VOZ
+                or (n_segs == 1 and voz_seg < SOSP_VOZ_MIN)):
+            return "sospechosa"
+        return None
+
+    def _transcribir(self, trozos, final, voz_seg, stats=None):
         t0 = time.perf_counter()
         audio = np.concatenate(trozos)
         audio = resample_poly(audio, self.up, self.down).astype(np.float32)
@@ -189,79 +265,125 @@ class Motor:
             audio,
             language=IDIOMA,
             beam_size=5 if final else 1,
-            vad_filter=final,
+            vad_filter=False,               # El VAD propio ya decidió que hay voz
             condition_on_previous_text=False,
             without_timestamps=True,
-            initial_prompt=self.contexto[-200:] or None,
+            initial_prompt=PROMPT_FIJO,
         )
-        texto = " ".join(s.text.strip() for s in segmentos).strip()
+        segmentos = list(segmentos)
+        partes, descartes = [], Counter()
+        for s in segmentos:
+            motivo = self._motivo_descarte(s, len(segmentos), voz_seg)
+            if motivo:
+                descartes[motivo] += 1
+            else:
+                partes.append(s.text.strip())
+        if stats is not None:
+            stats.update(descartes)
         # Solo métricas, nunca el texto (puede ser información de clientes)
         seg_audio = len(audio) / SR_MODELO
         dt = time.perf_counter() - t0
-        log.info("%-7s audio %5.1fs -> %.2fs (RTF %.2f) cola=%d",
-                 "final" if final else "parcial", seg_audio, dt, dt / max(seg_audio, 1e-6),
-                 self.cola_audio.qsize())
-        if texto.lower().strip(" .!¡") in ALUCINACIONES:
-            return ""
-        return texto
+        log.info("%-7s audio %5.1fs voz %4.1fs -> %.2fs (RTF %.2f) cola=%d segs %d/%d%s",
+                 "final" if final else "parcial", seg_audio, voz_seg, dt, dt / max(seg_audio, 1e-6),
+                 self.cola_audio.qsize(), len(partes), len(segmentos),
+                 "".join(f" {k}={v}" for k, v in descartes.items()))
+        return " ".join(partes).strip()
 
-    def _cerrar_frase(self, trozos):
-        texto = self._transcribir(trozos, final=True)
+    def _recortar(self, trozos, voz):
+        """Quita el silencio inicial y final, dejando RECORTE segundos de margen."""
+        con_voz = [i for i, v in enumerate(voz) if v > 0]
+        margen = max(1, round(RECORTE / TROZO))
+        return trozos[max(0, con_voz[0] - margen):con_voz[-1] + 1 + margen]
+
+    def _cerrar_frase(self, trozos, voz, stats):
+        voz_seg = sum(voz)
+        if voz_seg < VOZ_MIN:
+            stats["omitida_vad"] += 1
+            log.info("omitida audio %5.1fs voz %4.2fs (< VOZ_MIN)", len(trozos) * TROZO, voz_seg)
+            self.cola_ui.put(("parcial", ""))
+            return
+        texto = self._transcribir(self._recortar(trozos, voz), True, voz_seg, stats)
         self.cola_ui.put(("parcial", ""))
+        stats["frases"] += 1
         if texto:
-            self.contexto += " " + texto
             self.cola_ui.put(("final", texto))
 
     def _bucle(self, stop, cola_audio):
-        trozos, duracion = [], 0.0
-        ultima_voz = None
-        ultimo_parcial = 0.0
+        vad = DetectorVoz(self.up, self.down)
+        preroll = deque(maxlen=max(1, round(PRE_ROLL / TROZO)))
+        trozos, voz = [], []                # Audio de la frase actual y segundos de voz de cada trozo
+        duracion = silencio = 0.0           # En tiempo de audio
+        ultimo_audio = ultimo_parcial = time.time()
+        stats = Counter()
+
+        def agregar(x):
+            nonlocal duracion, silencio
+            v = vad.segundos_voz(x)
+            silencio = 0.0 if v > 0 else silencio + len(x) / self.tasa
+            if not trozos:
+                if v == 0:                  # Sin voz y sin frase abierta: solo pre-roll
+                    preroll.append(x)
+                    return
+                for p in preroll:
+                    trozos.append(p)
+                    voz.append(0.0)
+                    duracion += len(p) / self.tasa
+                preroll.clear()
+            trozos.append(x)
+            voz.append(v)
+            duracion += len(x) / self.tasa
+
+        def cerrar():
+            nonlocal trozos, voz, duracion
+            try:
+                self._cerrar_frase(trozos, voz, stats)
+            finally:
+                trozos, voz, duracion = [], [], 0.0
 
         while not stop.is_set():
             # Recoger todo el audio disponible
             try:
                 x = cola_audio.get(timeout=0.1)
                 while True:
-                    trozos.append(x)
-                    duracion += len(x) / self.tasa
-                    if np.sqrt(np.mean(x ** 2)) > UMBRAL_RMS:
-                        ultima_voz = time.time()
+                    agregar(x)
+                    ultimo_audio = time.time()
+                    if trozos and (silencio >= SILENCIO_FIN or duracion >= MAX_FRASE):
+                        break               # Cerrar antes de mezclar con la frase siguiente
                     x = cola_audio.get_nowait()
             except queue.Empty:
                 pass
 
             if not trozos:
                 continue
-            if ultima_voz is None:          # Solo silencio: descartar
-                trozos, duracion = [], 0.0
-                continue
-
-            ahora = time.time()
+            # WASAPI loopback puede dejar de entregar audio cuando nada suena
+            sin_audio = time.time() - ultimo_audio >= SILENCIO_FIN
             try:
-                if ahora - ultima_voz >= SILENCIO_FIN or duracion >= MAX_FRASE:
-                    self._cerrar_frase(trozos)
-                    trozos, duracion, ultima_voz = [], 0.0, None
-                elif ahora - ultimo_parcial >= INTERVALO_PARCIAL:
-                    self.cola_ui.put(("parcial", self._transcribir(trozos, final=False)))
+                if silencio >= SILENCIO_FIN or sin_audio or duracion >= MAX_FRASE:
+                    cerrar()
+                elif time.time() - ultimo_parcial >= INTERVALO_PARCIAL:
+                    voz_seg = sum(voz)
+                    if voz_seg >= VOZ_MIN:
+                        self.cola_ui.put(("parcial", self._transcribir(
+                            self._recortar(trozos, voz), False, voz_seg)))
                     ultimo_parcial = time.time()
             except Exception as e:
                 self.cola_ui.put(("estado", f"Error: {e}"))
 
         # Audio que quedó en la cola al detener (el stream ya está cerrado)
-        while True:
-            try:
-                x = cola_audio.get_nowait()
-            except queue.Empty:
-                break
-            trozos.append(x)
-            if np.sqrt(np.mean(x ** 2)) > UMBRAL_RMS:
-                ultima_voz = time.time()
         try:
-            if trozos and ultima_voz is not None:
-                self._cerrar_frase(trozos)
+            while True:
+                try:
+                    agregar(cola_audio.get_nowait())
+                except queue.Empty:
+                    break
+            if trozos:
+                cerrar()
         except Exception as e:
             self.cola_ui.put(("estado", f"Error: {e}"))
         finally:
+            log.info("resumen: frases=%d omitidas_vad=%d descartes:%s | VAD %.2f ms por s de audio",
+                     stats.pop("frases", 0), stats.pop("omitida_vad", 0),
+                     "".join(f" {k}={v}" for k, v in stats.items()) or " ninguno", vad.ms_por_segundo())
             self.cola_ui.put(("detenido", None))
 
 
@@ -337,7 +459,6 @@ class App:
 
     def limpiar(self):
         self.finales.clear()
-        self.motor.contexto = ""
         self.texto.configure(state="normal")
         self.texto.delete("1.0", "end")
         self.texto.mark_set("parcial_ini", "1.0")
