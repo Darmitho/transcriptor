@@ -35,6 +35,7 @@ PAUSA_CORTE = 0.2               # Micro-pausa (respiración) suficiente para cor
 MAX_FRASE = 20.0                # Sin pausas hasta aquí: se corta antes de la última palabra
 MAX_ARRASTRE = 3.0              # Audio máximo que pasa a la frase siguiente tras ese corte
 TROZO = 0.1                     # Duración de cada bloque de audio capturado (segundos)
+NOMBRE_OTROS = "Otros"          # Etiqueta del audio del PC (lo que dicen los demás)
 
 # --- Detección de voz (Silero VAD, incluido en faster-whisper, corre en CPU) ---
 VAD_UMBRAL = 0.5                # Probabilidad para considerar que empieza la voz
@@ -155,8 +156,102 @@ class DetectorVoz:
         return 1000 * self.t_vad / max(self.t_audio, 1e-6)
 
 
+class Fuente:
+    """Un origen de audio (loopback, micrófono...): su captura, su VAD y la frase en curso.
+    El callback de audio solo encola; todo lo demás corre en el hilo del Motor."""
+
+    def __init__(self, nombre, disp, cola):
+        self.nombre = nombre
+        self.disp = disp
+        self.cola = cola                    # Compartida por todas las fuentes: (fuente, trozo)
+        self.canales = disp["maxInputChannels"]
+        self.tasa = int(disp["defaultSampleRate"])
+        g = gcd(SR_MODELO, self.tasa)
+        self.up, self.down = SR_MODELO // g, self.tasa // g
+        self.stream = None
+        self.vad = DetectorVoz(self.up, self.down)
+        self.preroll = deque(maxlen=max(1, round(PRE_ROLL / TROZO)))
+        self.trozos, self.voz = [], []      # Audio de la frase actual y segundos de voz de cada trozo
+        self.duracion = self.silencio = 0.0  # En tiempo de audio
+        self.previo = ""                    # Texto antes de un corte en palabra (para quitar solapes)
+        self.ultimo_audio = self.ultimo_parcial = time.time()
+        self.stats = Counter()
+
+    # ---------- Captura ----------
+    def abrir(self, pa):
+        self.stream = pa.open(
+            format=pyaudio.paFloat32,
+            channels=self.canales,
+            rate=self.tasa,
+            input=True,
+            input_device_index=self.disp["index"],
+            frames_per_buffer=int(self.tasa * TROZO),
+            stream_callback=self._callback,
+        )
+        self.stream.start_stream()
+
+    def _callback(self, in_data, frame_count, time_info, status):
+        x = np.frombuffer(in_data, dtype=np.float32).reshape(-1, self.canales).mean(axis=1)
+        self.cola.put((self, x.copy()))
+        return (None, pyaudio.paContinue)
+
+    def cerrar_stream(self):
+        if self.stream:
+            try:
+                self.stream.stop_stream()   # Espera a que termine el callback en curso
+                self.stream.close()
+            finally:
+                self.stream = None
+
+    # ---------- Armado de frases ----------
+    def agregar(self, x):
+        v = self.vad.segundos_voz(x)
+        self.ultimo_audio = time.time()
+        self.silencio = 0.0 if v > 0 else self.silencio + len(x) / self.tasa
+        if not self.trozos:
+            if v == 0:                      # Sin voz y sin frase abierta: solo pre-roll
+                self.preroll.append(x)
+                return
+            for p in self.preroll:
+                self.trozos.append(p)
+                self.voz.append(0.0)
+                self.duracion += len(p) / self.tasa
+            self.preroll.clear()
+        self.trozos.append(x)
+        self.voz.append(v)
+        self.duracion += len(x) / self.tasa
+
+    def motivo_cierre(self, incluir_sin_audio=True):
+        if not self.trozos:
+            return None
+        if self.silencio >= SILENCIO_FIN:
+            return "silencio"
+        if self.duracion >= FRASE_LARGA and self.silencio >= PAUSA_CORTE:
+            return "pausa"
+        if self.duracion >= MAX_FRASE:
+            return "maximo"
+        # WASAPI loopback puede dejar de entregar audio cuando nada suena
+        if incluir_sin_audio and time.time() - self.ultimo_audio >= SILENCIO_FIN:
+            return "sin_audio"
+        return None
+
+    def reiniciar_frase(self, trozos=(), voz=()):
+        """Empieza una frase nueva, opcionalmente con el audio arrastrado de un corte."""
+        self.trozos, self.voz = list(trozos), list(voz)
+        self.duracion = sum(len(x) for x in self.trozos) / self.tasa
+
+    def resumen(self):
+        stats = Counter(self.stats)
+        cierres = {k[7:]: stats.pop(k) for k in list(stats) if k.startswith("cierre_")}
+        log.info("resumen [%s]: frases=%d omitidas_vad=%d cierres:%s descartes:%s | VAD %.2f ms por s de audio",
+                 self.nombre, stats.pop("frases", 0), stats.pop("omitida_vad", 0),
+                 "".join(f" {k}={v}" for k, v in cierres.items()) or " ninguno",
+                 "".join(f" {k}={v}" for k, v in stats.items()) or " ninguno", self.vad.ms_por_segundo())
+
+
 class Motor:
-    """Captura de audio + transcripción en un hilo aparte."""
+    """Un solo modelo Whisper y un solo hilo que atiende a todas las fuentes de audio
+    (la GPU de 4 GB no da para dos modelos). Los finales tienen prioridad sobre los parciales."""
 
     def __init__(self, cola_ui):
         self.cola_ui = cola_ui
@@ -164,9 +259,8 @@ class Motor:
         self.stop = threading.Event()
         self.modelo = None
         self.pa = None
-        self.stream = None
+        self.fuentes = []
         self.hilo = None
-        self.tasa = 48000
 
     # ---------- Modelo ----------
     def cargar_modelo(self):
@@ -202,11 +296,6 @@ class Motor:
                 return lb
         raise RuntimeError("No se encontró un dispositivo loopback para la salida predeterminada.")
 
-    def _callback(self, in_data, frame_count, time_info, status):
-        x = np.frombuffer(in_data, dtype=np.float32).reshape(-1, self.canales).mean(axis=1)
-        self.cola_audio.put(x.copy())
-        return (None, pyaudio.paContinue)
-
     def hilo_activo(self):
         return self.hilo is not None and self.hilo.is_alive()
 
@@ -218,41 +307,27 @@ class Motor:
         self.cola_audio = queue.Queue()
         self.pa = pyaudio.PyAudio()
         try:
-            disp = self._dispositivo_loopback()
-            self.canales = disp["maxInputChannels"]
-            self.tasa = int(disp["defaultSampleRate"])
-            g = gcd(SR_MODELO, self.tasa)
-            self.up, self.down = SR_MODELO // g, self.tasa // g
-            self.stream = self.pa.open(
-                format=pyaudio.paFloat32,
-                channels=self.canales,
-                rate=self.tasa,
-                input=True,
-                input_device_index=disp["index"],
-                frames_per_buffer=int(self.tasa * TROZO),
-                stream_callback=self._callback,
-            )
-            self.stream.start_stream()
+            otros = Fuente(NOMBRE_OTROS, self._dispositivo_loopback(), self.cola_audio)
+            otros.abrir(self.pa)
         except Exception:
-            if self.stream:
-                self.stream.close()
             self.pa.terminate()
-            self.stream = self.pa = None
+            self.pa = None
             raise
-        self.hilo = threading.Thread(target=self._bucle, args=(self.stop, self.cola_audio), daemon=True)
+        self.fuentes = [otros]
+        self.hilo = threading.Thread(target=self._bucle, args=(self.stop, self.cola_audio, self.fuentes),
+                                     daemon=True)
         self.hilo.start()
-        self.cola_ui.put(("estado", f"Escuchando: {disp['name']}"))
+        self.cola_ui.put(("estado", f"Escuchando: {otros.disp['name']}"))
 
     def detener(self):
-        """Corta la captura. El hilo cierra la frase pendiente y avisa con 'detenido'."""
+        """Corta la captura. El hilo cierra las frases pendientes y avisa con 'detenido'."""
         try:
-            if self.stream:
-                self.stream.stop_stream()   # Espera a que termine el callback en curso
-                self.stream.close()
+            for f in self.fuentes:
+                f.cerrar_stream()
         finally:
             if self.pa:
                 self.pa.terminate()
-            self.stream = self.pa = None
+            self.pa = None
             self.stop.set()
         self.cola_ui.put(("estado", "Deteniendo..."))
 
@@ -271,11 +346,11 @@ class Motor:
             return "sospechosa"
         return None
 
-    def _transcribir(self, trozos, final, voz_seg, stats=None, palabras=False):
+    def _transcribir(self, fuente, trozos, final, voz_seg, palabras=False):
         """Devuelve (texto, segmentos conservados). Con palabras=True incluye sus tiempos."""
         t0 = time.perf_counter()
         audio = np.concatenate(trozos)
-        audio = resample_poly(audio, self.up, self.down).astype(np.float32)
+        audio = resample_poly(audio, fuente.up, fuente.down).astype(np.float32)
         segmentos, _ = self.modelo.transcribe(
             audio,
             language=IDIOMA,
@@ -296,14 +371,14 @@ class Motor:
                 descartes[motivo] += 1
             else:
                 conservados.append(s)
-        if stats is not None:
-            stats.update(descartes)
+        if final:
+            fuente.stats.update(descartes)
         # Solo métricas, nunca el texto (puede ser información de clientes)
         seg_audio = len(audio) / SR_MODELO
         dt = time.perf_counter() - t0
-        log.info("%-7s audio %5.1fs voz %4.1fs -> %.2fs (RTF %.2f) cola=%d segs %d/%d%s",
-                 "final" if final else "parcial", seg_audio, voz_seg, dt, dt / max(seg_audio, 1e-6),
-                 self.cola_audio.qsize(), len(conservados), len(segmentos),
+        log.info("%-7s [%s] audio %5.1fs voz %4.1fs -> %.2fs (RTF %.2f) cola=%d segs %d/%d%s",
+                 "final" if final else "parcial", fuente.nombre, seg_audio, voz_seg, dt,
+                 dt / max(seg_audio, 1e-6), self.cola_audio.qsize(), len(conservados), len(segmentos),
                  "".join(f" {k}={v}" for k, v in descartes.items()))
         return " ".join(s.text.strip() for s in conservados).strip(), conservados
 
@@ -313,13 +388,13 @@ class Motor:
         margen = max(1, round(RECORTE / TROZO))
         return max(0, con_voz[0] - margen), con_voz[-1] + 1 + margen
 
-    def _partir_en_palabra(self, texto, segmentos, trozos, voz):
+    def _partir_en_palabra(self, fuente, texto, segmentos, trozos, voz):
         """Fija el texto hasta la penúltima palabra y devuelve el audio desde la última
         (que pudo quedar cortada) para la frase siguiente: (texto, trozos_resto, voz_resto)."""
         palabras = [w for s in segmentos for w in (s.words or [])]
         if len(palabras) < 2:
             return texto, [], []
-        muestra = int(max(0.0, palabras[-1].start - 0.1) * self.tasa)
+        muestra = int(max(0.0, palabras[-1].start - 0.1) * fuente.tasa)
         acum = 0
         for j, x in enumerate(trozos):
             if acum + len(x) > muestra:
@@ -330,132 +405,98 @@ class Motor:
         desde = muestra - acum
         resto_t = [trozos[j][desde:]] + trozos[j + 1:]
         resto_v = [voz[j] * (len(trozos[j]) - desde) / len(trozos[j])] + voz[j + 1:]
-        arrastre = sum(len(x) for x in resto_t) / self.tasa
+        arrastre = sum(len(x) for x in resto_t) / fuente.tasa
         if arrastre > MAX_ARRASTRE:         # Tiempos poco fiables: mejor no arrastrar
             return texto, [], []
-        log.info("corte en palabra: %.2fs de audio pasan a la frase siguiente", arrastre)
+        log.info("corte en palabra [%s]: %.2fs de audio pasan a la frase siguiente", fuente.nombre, arrastre)
         return "".join(w.word for w in palabras[:-1]).strip(), resto_t, resto_v
 
-    def _cerrar_frase(self, trozos, voz, stats, cortar=False, previo=""):
-        """Transcribe y publica la frase. Con cortar=True devuelve el audio que pasa
-        a la frase siguiente; previo es el texto anterior, para quitar repeticiones."""
-        voz_seg = sum(voz)
-        if voz_seg < VOZ_MIN:
-            stats["omitida_vad"] += 1
-            log.info("omitida audio %5.1fs voz %4.2fs (< VOZ_MIN)", len(trozos) * TROZO, voz_seg)
-            self.cola_ui.put(("parcial", ""))
-            return "", [], []
-        ini, fin = self._recortar(voz)
-        if cortar:
-            fin = len(trozos)               # La voz sigue: no recortar el final
-        texto, segmentos = self._transcribir(trozos[ini:fin], True, voz_seg, stats, palabras=cortar)
+    def _cerrar_frase(self, fuente, motivo):
+        """Transcribe y publica la frase en curso de la fuente. Si el motivo es 'maximo',
+        el audio desde la última palabra pasa a la frase siguiente."""
+        trozos, voz = fuente.trozos, fuente.voz
+        fuente.stats["cierre_" + motivo] += 1
         resto_t, resto_v = [], []
-        if cortar:
-            texto, resto_t, resto_v = self._partir_en_palabra(texto, segmentos, trozos[ini:], voz[ini:])
-        if previo:
-            texto = _quitar_solape(previo, texto)
-        self.cola_ui.put(("parcial", ""))
-        stats["frases"] += 1
-        if texto:
-            self.cola_ui.put(("final", texto))
-        return texto, resto_t, resto_v
+        try:
+            voz_seg = sum(voz)
+            if voz_seg < VOZ_MIN:
+                fuente.stats["omitida_vad"] += 1
+                log.info("omitida [%s] audio %5.1fs voz %4.2fs (< VOZ_MIN)",
+                         fuente.nombre, len(trozos) * TROZO, voz_seg)
+                self.cola_ui.put(("parcial", (fuente.nombre, "")))
+                return
+            cortar = motivo == "maximo"
+            ini, fin = self._recortar(voz)
+            if cortar:
+                fin = len(trozos)           # La voz sigue: no recortar el final
+            texto, segmentos = self._transcribir(fuente, trozos[ini:fin], True, voz_seg, palabras=cortar)
+            if cortar:
+                texto, resto_t, resto_v = self._partir_en_palabra(
+                    fuente, texto, segmentos, trozos[ini:], voz[ini:])
+            if fuente.previo:
+                texto = _quitar_solape(fuente.previo, texto)
+            fuente.previo = texto if resto_t else ""
+            self.cola_ui.put(("parcial", (fuente.nombre, "")))
+            fuente.stats["frases"] += 1
+            if texto:
+                self.cola_ui.put(("final", (fuente.nombre, texto)))
+        finally:
+            fuente.reiniciar_frase(resto_t, resto_v)
 
-    def _bucle(self, stop, cola_audio):
-        vad = DetectorVoz(self.up, self.down)
-        preroll = deque(maxlen=max(1, round(PRE_ROLL / TROZO)))
-        trozos, voz = [], []                # Audio de la frase actual y segundos de voz de cada trozo
-        duracion = silencio = 0.0           # En tiempo de audio
-        previo = ""                         # Texto antes de un corte en palabra (para quitar solapes)
-        ultimo_audio = ultimo_parcial = time.time()
-        stats = Counter()
+    def _parcial(self, fuente):
+        fuente.ultimo_parcial = time.time()
+        voz_seg = sum(fuente.voz)
+        if voz_seg >= VOZ_MIN:
+            ini, fin = self._recortar(fuente.voz)
+            texto = self._transcribir(fuente, fuente.trozos[ini:fin], False, voz_seg)[0]
+            self.cola_ui.put(("parcial", (fuente.nombre, texto)))
+        fuente.ultimo_parcial = time.time()
 
-        def agregar(x):
-            nonlocal duracion, silencio
-            v = vad.segundos_voz(x)
-            silencio = 0.0 if v > 0 else silencio + len(x) / self.tasa
-            if not trozos:
-                if v == 0:                  # Sin voz y sin frase abierta: solo pre-roll
-                    preroll.append(x)
-                    return
-                for p in preroll:
-                    trozos.append(p)
-                    voz.append(0.0)
-                    duracion += len(p) / self.tasa
-                preroll.clear()
-            trozos.append(x)
-            voz.append(v)
-            duracion += len(x) / self.tasa
-
-        def motivo_cierre():
-            if silencio >= SILENCIO_FIN:
-                return "silencio"
-            if duracion >= FRASE_LARGA and silencio >= PAUSA_CORTE:
-                return "pausa"
-            if duracion >= MAX_FRASE:
-                return "maximo"
-            return None
-
-        def cerrar(motivo):
-            nonlocal trozos, voz, duracion, previo
-            stats["cierre_" + motivo] += 1
-            resto_t, resto_v = [], []
-            try:
-                texto, resto_t, resto_v = self._cerrar_frase(
-                    trozos, voz, stats, cortar=motivo == "maximo", previo=previo)
-                previo = texto if resto_t else ""
-            finally:
-                trozos, voz = resto_t, resto_v
-                duracion = sum(len(x) for x in trozos) / self.tasa
-
+    def _bucle(self, stop, cola_audio, fuentes):
         while not stop.is_set():
-            # Recoger todo el audio disponible
+            # Recoger todo el audio disponible, repartido a su fuente
             try:
-                x = cola_audio.get(timeout=0.1)
+                fuente, x = cola_audio.get(timeout=0.1)
                 while True:
-                    agregar(x)
-                    ultimo_audio = time.time()
-                    if trozos and motivo_cierre():
+                    fuente.agregar(x)
+                    if fuente.motivo_cierre(incluir_sin_audio=False):
                         break               # Cerrar antes de mezclar con la frase siguiente
-                    x = cola_audio.get_nowait()
+                    fuente, x = cola_audio.get_nowait()
             except queue.Empty:
                 pass
 
-            if not trozos:
-                continue
-            # WASAPI loopback puede dejar de entregar audio cuando nada suena
-            motivo = motivo_cierre()
-            if not motivo and time.time() - ultimo_audio >= SILENCIO_FIN:
-                motivo = "sin_audio"
             try:
-                if motivo:
-                    cerrar(motivo)
-                elif time.time() - ultimo_parcial >= INTERVALO_PARCIAL:
-                    voz_seg = sum(voz)
-                    if voz_seg >= VOZ_MIN:
-                        ini, fin = self._recortar(voz)
-                        self.cola_ui.put(("parcial", self._transcribir(
-                            trozos[ini:fin], False, voz_seg)[0]))
-                    ultimo_parcial = time.time()
+                # Primero los finales (lo que se guarda), luego un parcial a la vez:
+                # el de la fuente que lleva más tiempo sin refrescarse
+                pendientes = [(f, f.motivo_cierre()) for f in fuentes]
+                pendientes = [(f, m) for f, m in pendientes if m]
+                for f, motivo in pendientes:
+                    self._cerrar_frase(f, motivo)
+                if pendientes:
+                    continue
+                ahora = time.time()
+                candidatas = [f for f in fuentes if f.trozos and ahora - f.ultimo_parcial >= INTERVALO_PARCIAL]
+                if candidatas:
+                    self._parcial(min(candidatas, key=lambda f: f.ultimo_parcial))
             except Exception as e:
                 self.cola_ui.put(("estado", f"Error: {e}"))
 
-        # Audio que quedó en la cola al detener (el stream ya está cerrado)
+        # Audio que quedó en la cola al detener (los streams ya están cerrados)
         try:
             while True:
                 try:
-                    agregar(cola_audio.get_nowait())
+                    fuente, x = cola_audio.get_nowait()
                 except queue.Empty:
                     break
-            if trozos:
-                cerrar("detener")
+                fuente.agregar(x)
+            for f in fuentes:
+                if f.trozos:
+                    self._cerrar_frase(f, "detener")
         except Exception as e:
             self.cola_ui.put(("estado", f"Error: {e}"))
         finally:
-            cierres = {k[7:]: stats.pop(k) for k in list(stats) if k.startswith("cierre_")}
-            log.info("resumen: frases=%d omitidas_vad=%d cierres:%s descartes:%s | VAD %.2f ms por s de audio",
-                     stats.pop("frases", 0), stats.pop("omitida_vad", 0),
-                     "".join(f" {k}={v}" for k, v in cierres.items()) or " ninguno",
-                     "".join(f" {k}={v}" for k, v in stats.items()) or " ninguno", vad.ms_por_segundo())
+            for f in fuentes:
+                f.resumen()
             self.cola_ui.put(("detenido", None))
 
 
@@ -467,6 +508,7 @@ class App:
         self.cola_ui = queue.Queue()
         self.motor = Motor(self.cola_ui)
         self.finales = []
+        self.parciales = {}                 # Texto provisional por fuente
         self.activo = False
         self.cerrando = False
         self.destruida = False
@@ -531,6 +573,7 @@ class App:
 
     def limpiar(self):
         self.finales.clear()
+        self.parciales.clear()
         self.texto.configure(state="normal")
         self.texto.delete("1.0", "end")
         self.texto.mark_set("parcial_ini", "1.0")
@@ -591,26 +634,34 @@ class App:
         except queue.Empty:
             pass
 
-    def _poner_parcial(self, s):
+    def _mostrar_parciales(self):
         self.texto.configure(state="normal")
-        self.texto.delete("parcial_ini", "end")
+        self.texto.delete("parcial_ini", "end-1c")   # "end" borraría también el último salto de línea
+        s = "\n".join(t for t in self.parciales.values() if t)
         if s:
             self.texto.insert("end", s, "parcial")
         self.texto.configure(state="disabled")
         self.texto.see("end")
 
-    def _agregar_final(self, s):
+    def _poner_parcial(self, valor):
+        fuente, s = valor
+        self.parciales[fuente] = s
+        self._mostrar_parciales()
+
+    def _agregar_final(self, valor):
+        fuente, s = valor
+        self.parciales[fuente] = ""
         hora = datetime.datetime.now().strftime("%H:%M:%S")
         self.finales.append((hora, s))
         with open(self.archivo_auto, "a", encoding="utf-8") as f:
             f.write(f"[{hora}] {s}\n")
         self.texto.configure(state="normal")
-        self.texto.delete("parcial_ini", "end")
+        self.texto.delete("parcial_ini", "end-1c")   # "end" borraría también el último salto de línea
         self.texto.insert("end", f"{hora}  ", "hora")
         self.texto.insert("end", s + "\n")
         self.texto.mark_set("parcial_ini", "end-1c")
         self.texto.configure(state="disabled")
-        self.texto.see("end")
+        self._mostrar_parciales()           # Parciales de otras fuentes, debajo del final
 
 
 if __name__ == "__main__":
