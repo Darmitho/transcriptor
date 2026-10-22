@@ -56,7 +56,8 @@ class Muestreador:
                 "ram": self.proc.memory_info().rss / 2**20,
                 "vram": pynvml.nvmlDeviceGetMemoryInfo(self.gpu).used / 2**20,
                 "gpu": pynvml.nvmlDeviceGetUtilizationRates(self.gpu).gpu,
-                "cola": self.motor.cola_audio.qsize(),
+                # Atraso por fuente: la cola mezcla los trozos de todas
+                "cola": self.motor.cola_audio.qsize() / max(1, len(self.motor.fuentes)),
             })
 
     def medir(self):
@@ -235,7 +236,7 @@ def main():
         ("Finales: n, RTF prom", lambda r: f"{r['final_n']}, {r['final_rtf_prom']:.2f}"),
         ("Latencia fin de habla -> texto (prom / p95 / máx s)",
          lambda r: f"{r['latencia_prom']:.2f} / {r['latencia_p95']:.2f} / {r['latencia_max']:.2f}" if r["latencia_n"] else "-"),
-        ("Atraso máx de la cola (s)", lambda r: f"{r['cola_max_s']:.1f}"),
+        ("Atraso máx de la cola por fuente (s)", lambda r: f"{r['cola_max_s']:.1f}"),
     ]
     cols = ["detenido", "silencio", "una_fuente", "dos_fuentes"]
     print(f"\n{'':52s}" + "".join(f"{c:>20s}" for c in cols))
