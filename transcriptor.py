@@ -12,6 +12,7 @@ import re
 import sys
 import glob
 import queue
+import bisect
 import logging
 import threading
 import time
@@ -188,15 +189,16 @@ class Fuente:
     def __init__(self, nombre, disp, cola):
         self.nombre = nombre
         self.disp = disp
-        self.cola = cola                    # Compartida por todas las fuentes: (fuente, trozo)
+        self.cola = cola                    # Compartida por todas las fuentes: (fuente, trozo, inicio)
         self.canales = disp["maxInputChannels"]
         self.tasa = int(disp["defaultSampleRate"])
         g = gcd(SR_MODELO, self.tasa)
         self.up, self.down = SR_MODELO // g, self.tasa // g
         self.stream = None
         self.vad = DetectorVoz(self.up, self.down)
-        self.preroll = deque(maxlen=max(1, round(PRE_ROLL / TROZO)))
-        self.trozos, self.voz = [], []      # Audio de la frase actual y segundos de voz de cada trozo
+        self.preroll = deque(maxlen=max(1, round(PRE_ROLL / TROZO)))   # (trozo, inicio)
+        # Frase actual: audio, segundos de voz y hora (epoch) en que empezó cada trozo
+        self.trozos, self.voz, self.inicios = [], [], []
         self.duracion = self.silencio = 0.0  # En tiempo de audio
         self.previo = ""                    # Texto antes de un corte en palabra (para quitar solapes)
         self.ultimo_audio = self.ultimo_parcial = time.time()
@@ -218,7 +220,8 @@ class Fuente:
 
     def _callback(self, in_data, frame_count, time_info, status):
         x = np.frombuffer(in_data, dtype=np.float32).reshape(-1, self.canales).mean(axis=1)
-        self.cola.put((self, x.copy()))
+        # El callback llega cuando el bloque terminó de capturarse: su inicio fue antes
+        self.cola.put((self, x.copy(), time.time() - frame_count / self.tasa))
         return (None, pyaudio.paContinue)
 
     def cerrar_stream(self):
@@ -230,22 +233,28 @@ class Fuente:
                 self.stream = None
 
     # ---------- Armado de frases ----------
-    def agregar(self, x):
+    def agregar(self, x, inicio):
         v = self.vad.segundos_voz(x)
         self.ultimo_audio = time.time()
         self.silencio = 0.0 if v > 0 else self.silencio + len(x) / self.tasa
         if not self.trozos:
             if v == 0:                      # Sin voz y sin frase abierta: solo pre-roll
-                self.preroll.append(x)
+                self.preroll.append((x, inicio))
                 return
-            for p in self.preroll:
+            for p, t in self.preroll:
                 self.trozos.append(p)
                 self.voz.append(0.0)
+                self.inicios.append(t)
                 self.duracion += len(p) / self.tasa
             self.preroll.clear()
         self.trozos.append(x)
         self.voz.append(v)
+        self.inicios.append(inicio)
         self.duracion += len(x) / self.tasa
+
+    def inicio_voz(self):
+        """Hora (epoch) en que empezó la voz de la frase actual: la del primer trozo con voz."""
+        return next(t for t, v in zip(self.inicios, self.voz) if v > 0)
 
     def motivo_cierre(self, incluir_sin_audio=True):
         if not self.trozos:
@@ -261,9 +270,9 @@ class Fuente:
             return "sin_audio"
         return None
 
-    def reiniciar_frase(self, trozos=(), voz=()):
+    def reiniciar_frase(self, trozos=(), voz=(), inicios=()):
         """Empieza una frase nueva, opcionalmente con el audio arrastrado de un corte."""
-        self.trozos, self.voz = list(trozos), list(voz)
+        self.trozos, self.voz, self.inicios = list(trozos), list(voz), list(inicios)
         self.duracion = sum(len(x) for x in self.trozos) / self.tasa
 
     def resumen(self):
@@ -478,12 +487,13 @@ class Motor:
         margen = max(1, round(RECORTE / TROZO))
         return max(0, con_voz[0] - margen), con_voz[-1] + 1 + margen
 
-    def _partir_en_palabra(self, fuente, texto, segmentos, trozos, voz):
+    def _partir_en_palabra(self, fuente, texto, segmentos, trozos, voz, inicios):
         """Fija el texto hasta la penúltima palabra y devuelve el audio desde la última
-        (que pudo quedar cortada) para la frase siguiente: (texto, trozos_resto, voz_resto)."""
+        (que pudo quedar cortada) para la frase siguiente: (texto, (trozos, voz, inicios) del resto)."""
+        sin_resto = (texto, ([], [], []))
         palabras = [w for s in segmentos for w in (s.words or [])]
         if len(palabras) < 2:
-            return texto, [], []
+            return sin_resto
         muestra = int(max(0.0, palabras[-1].start - 0.1) * fuente.tasa)
         acum = 0
         for j, x in enumerate(trozos):
@@ -491,22 +501,23 @@ class Motor:
                 break
             acum += len(x)
         else:
-            return texto, [], []
+            return sin_resto
         desde = muestra - acum
         resto_t = [trozos[j][desde:]] + trozos[j + 1:]
         resto_v = [voz[j] * (len(trozos[j]) - desde) / len(trozos[j])] + voz[j + 1:]
+        resto_i = [inicios[j] + desde / fuente.tasa] + inicios[j + 1:]
         arrastre = sum(len(x) for x in resto_t) / fuente.tasa
         if arrastre > MAX_ARRASTRE:         # Tiempos poco fiables: mejor no arrastrar
-            return texto, [], []
+            return sin_resto
         log.info("corte en palabra [%s]: %.2fs de audio pasan a la frase siguiente", fuente.nombre, arrastre)
-        return "".join(w.word for w in palabras[:-1]).strip(), resto_t, resto_v
+        return "".join(w.word for w in palabras[:-1]).strip(), (resto_t, resto_v, resto_i)
 
     def _cerrar_frase(self, fuente, motivo):
         """Transcribe y publica la frase en curso de la fuente. Si el motivo es 'maximo',
         el audio desde la última palabra pasa a la frase siguiente."""
-        trozos, voz = fuente.trozos, fuente.voz
+        trozos, voz, inicios = fuente.trozos, fuente.voz, fuente.inicios
         fuente.stats["cierre_" + motivo] += 1
-        resto_t, resto_v = [], []
+        resto = ([], [], [])
         try:
             voz_seg = sum(voz)
             if voz_seg < VOZ_MIN:
@@ -521,17 +532,17 @@ class Motor:
                 fin = len(trozos)           # La voz sigue: no recortar el final
             texto, segmentos = self._transcribir(fuente, trozos[ini:fin], True, voz_seg, palabras=cortar)
             if cortar:
-                texto, resto_t, resto_v = self._partir_en_palabra(
-                    fuente, texto, segmentos, trozos[ini:], voz[ini:])
+                texto, resto = self._partir_en_palabra(
+                    fuente, texto, segmentos, trozos[ini:], voz[ini:], inicios[ini:])
             if fuente.previo:
                 texto = _quitar_solape(fuente.previo, texto)
-            fuente.previo = texto if resto_t else ""
+            fuente.previo = texto if resto[0] else ""
             self.cola_ui.put(("parcial", (fuente.nombre, "")))
             fuente.stats["frases"] += 1
             if texto:
-                self.cola_ui.put(("final", (fuente.nombre, texto)))
+                self.cola_ui.put(("final", (fuente.nombre, texto, fuente.inicio_voz())))
         finally:
-            fuente.reiniciar_frase(resto_t, resto_v)
+            fuente.reiniciar_frase(*resto)
 
     def _parcial(self, fuente):
         fuente.ultimo_parcial = time.time()
@@ -547,12 +558,12 @@ class Motor:
             # Recoger todo el audio disponible, repartido a su fuente
             vaciada = False
             try:
-                fuente, x = cola_audio.get(timeout=0.1)
+                fuente, x, inicio = cola_audio.get(timeout=0.1)
                 while True:
-                    fuente.agregar(x)
+                    fuente.agregar(x, inicio)
                     if fuente.motivo_cierre(incluir_sin_audio=False):
                         break               # Cerrar antes de mezclar con la frase siguiente
-                    fuente, x = cola_audio.get_nowait()
+                    fuente, x, inicio = cola_audio.get_nowait()
             except queue.Empty:
                 vaciada = True
 
@@ -587,10 +598,10 @@ class Motor:
         try:
             while True:
                 try:
-                    fuente, x = cola_audio.get_nowait()
+                    fuente, x, inicio = cola_audio.get_nowait()
                 except queue.Empty:
                     break
-                fuente.agregar(x)
+                fuente.agregar(x, inicio)
             for f in fuentes:
                 if f.trozos:
                     self._cerrar_frase(f, "detener")
@@ -609,7 +620,9 @@ class App:
         self.root = root
         self.cola_ui = queue.Queue()
         self.motor = Motor(self.cola_ui)
-        self.finales = []
+        # Frases finales (inicio, hora, fuente, texto) ordenadas por inicio del habla:
+        # las de la ventana (Limpiar las borra) y las de la sesión (van al .txt automático)
+        self.finales, self.registro = [], []
         self.parciales = {}                 # Texto provisional por fuente
         self.activo = False
         self.cerrando = False
@@ -725,7 +738,7 @@ class App:
                                             filetypes=[("Texto", "*.txt")])
         if ruta:
             with open(ruta, "w", encoding="utf-8") as f:
-                f.write("\n".join(f"[{h}] {fuente}: {t}" for h, fuente, t in self.finales))
+                f.write("\n".join(f"[{h}] {fuente}: {t}" for _, h, fuente, t in self.finales))
 
     def cerrar(self):
         if self.cerrando:
@@ -795,19 +808,37 @@ class App:
         self._mostrar_parciales()
 
     def _agregar_final(self, valor):
-        fuente, s = valor
+        fuente, s, inicio = valor
         self.parciales[fuente] = ""
-        hora = datetime.datetime.now().strftime("%H:%M:%S")
-        self.finales.append((hora, fuente, s))
-        with open(self.archivo_auto, "a", encoding="utf-8") as f:
-            f.write(f"[{hora}] {fuente}: {s}\n")
+        # Hora en que empezó a hablarse, no en que terminó de transcribirse. Con dos
+        # fuentes solapadas una frase puede llegar después de otra que empezó más tarde:
+        # se inserta en su lugar cronológico
+        hora = datetime.datetime.fromtimestamp(inicio).strftime("%H:%M:%S")
+        frase = (inicio, hora, fuente, s)
+        bisect.insort_right(self.registro, frase, key=lambda f: f[0])
+        self._guardar_registro()
+        pos = bisect.bisect_right(self.finales, inicio, key=lambda f: f[0])
+        self.finales.insert(pos, frase)
         self.texto.configure(state="normal")
         self.texto.delete("parcial_ini", "end-1c")   # "end" borraría también el último salto de línea
-        self.texto.insert("end", f"{hora}  ", "hora")
-        self.texto.insert("end", f"{fuente}: {s}\n")
+        linea = pos + 1                     # Cada frase final ocupa una línea del texto
+        self.texto.insert(f"{linea}.0", f"{hora}  ", "hora")
+        self.texto.insert(f"{linea}.{len(hora) + 2}", f"{fuente}: {s}\n")
         self.texto.mark_set("parcial_ini", "end-1c")
         self.texto.configure(state="disabled")
         self._mostrar_parciales()           # Parciales de otras fuentes, debajo del final
+
+    def _guardar_registro(self):
+        """Reescribe el .txt automático ya ordenado. Se escribe a un temporal y se
+        reemplaza, para que un corte a mitad de escritura no deje el archivo a medias."""
+        tmp = self.archivo_auto + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(f"[{h}] {fuente}: {t}\n" for _, h, fuente, t in self.registro)
+            os.replace(tmp, self.archivo_auto)
+        except OSError as e:
+            log.error("No se pudo guardar %s: %s", self.archivo_auto, e)
+            self.estado.configure(text="Error al guardar el .txt (ver consola)")
 
 
 if __name__ == "__main__":

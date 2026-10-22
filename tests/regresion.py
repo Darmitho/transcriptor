@@ -51,13 +51,28 @@ def correr_escenario(motor, pistas, velocidad):
     motor.hilo = threading.Thread(target=motor._bucle, args=(motor.stop, motor.cola_audio, motor.fuentes),
                                   daemon=True)
     motor.hilo.start()
+    t0 = time.time()
     alimentar({n: a for n, (a, _) in pistas.items()}, fuentes, motor.cola_audio, velocidad)
     time.sleep(1.0)
     motor.stop.set()
     motor.hilo.join(120)
     msgs = list(cola_ui.queue)
     assert msgs and msgs[-1][0] == "detenido", "el hilo no avisó 'detenido'"
-    return {n: " ".join(v[1] for k, v in msgs if k == "final" and v[0] == n) for n in pistas}
+    finales = [v for k, v in msgs if k == "final"]
+    textos = {n: " ".join(f[1] for f in finales if f[0] == n) for n in pistas}
+    # Segundos de audio (desde el inicio de la pista) en que empezó cada frase, por fuente
+    inicios = {n: [(f[2] - t0) * velocidad for f in finales if f[0] == n] for n in pistas}
+    return textos, inicios
+
+
+# Dónde empieza la voz en cada pista (segundos de audio), según cómo se arman en escenarios():
+# 1 s de silencio + 0.1 s de silencio propio del clip; "Yo" va 3 s detrás de "Otros"
+HORAS_ESPERADAS = {
+    ("frase + 30 s de silencio", "Otros"): 1.1,
+    ("habla continua 25 s", "Otros"): 1.0,
+    ("dos fuentes a la vez", "Yo"): 4.0,
+}
+TOLERANCIA_HORA = 0.4                   # Trozos de 100 ms + reparto de la cola
 
 
 def pruebas_unitarias(motor):
@@ -91,29 +106,81 @@ def pruebas_unitarias(motor):
     return len(casos) + len(otros), fallos
 
 
+def prueba_ventana():
+    """Frases que llegan fuera de orden: la ventana, Guardar y el .txt quedan cronológicos,
+    y Limpiar no borra nada del .txt. No carga el modelo."""
+    import tempfile
+    import tkinter as tk
+    cargar, carpeta = T.Motor.cargar_modelo, T.CARPETA_SALIDA
+    T.Motor.cargar_modelo, T.CARPETA_SALIDA = (lambda self: None), tempfile.mkdtemp(prefix="regresion_")
+    try:
+        root = tk.Tk()
+        app = T.App(root)
+        base = time.time()
+        for fuente, texto, seg in [("Otros", "Segunda.", 10), ("Yo", "Primera.", 5),
+                                   ("Otros", "Cuarta.", 30), ("Yo", "Tercera.", 20)]:
+            app.cola_ui.put(("final", (fuente, texto, base + seg)))
+        app.cola_ui.put(("parcial", ("Otros", "provisional")))
+        app._procesar_cola()
+        ventana = app.texto.get("1.0", "end-1c").splitlines()
+        with open(app.archivo_auto, encoding="utf-8") as f:
+            archivo = f.read().splitlines()
+        app.limpiar()
+        app.cola_ui.put(("final", ("Yo", "Quinta.", base + 40)))
+        app._procesar_cola()
+        with open(app.archivo_auto, encoding="utf-8") as f:
+            tras_limpiar = f.read().splitlines()
+        root.destroy()
+    finally:
+        T.Motor.cargar_modelo, T.CARPETA_SALIDA = cargar, carpeta
+    orden = ["Primera.", "Segunda.", "Tercera.", "Cuarta."]
+    hora = lambda s: time.strftime("%H:%M:%S", time.localtime(base + s))
+    fallos = []
+    if [l.split(": ", 1)[-1] for l in ventana[:4]] != orden or ventana[4] != "Otros: provisional":
+        fallos.append(("ventana", ventana))
+    if [l.split(": ", 1)[-1] for l in archivo] != orden or not archivo[0].startswith(f"[{hora(5)}] Yo:"):
+        fallos.append(("archivo", archivo))
+    if len(tras_limpiar) != 5:
+        fallos.append(("Limpiar borró líneas del .txt", tras_limpiar))
+    return fallos
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--velocidad", type=float, default=1.0, help="1.0 = tiempo real (lo representativo)")
     args = ap.parse_args()
 
+    fallos_unit = prueba_ventana()
     motor = T.Motor(queue.Queue())
     motor.cargar_modelo()
-    n_unit, fallos_unit = pruebas_unitarias(motor)
+    n_unit, f_unit = pruebas_unitarias(motor)
+    fallos_unit += f_unit
+    n_unit += 1                         # + la prueba de la ventana
     print(f"\nunitarias: {n_unit - len(fallos_unit)}/{n_unit} OK")
     for f in fallos_unit:
         print("  FALLO:", f)
 
     total_err = total_pal = fallos = 0
-    print(f"\n{'escenario':28s} {'fuente':6s} {'errores':>8s} {'palabras':>9s}  resultado")
+    print(f"\n{'escenario':28s} {'fuente':6s} {'errores':>8s} {'palabras':>9s} {'inicio 1ª frase':>16s}  resultado")
     for nombre, pistas in escenarios().items():
-        textos = correr_escenario(motor, pistas, args.velocidad)
+        textos, inicios = correr_escenario(motor, pistas, args.velocidad)
         for fuente, (_, ref) in pistas.items():
             err, pal = errores_palabras(ref, textos[fuente])
             ok = (1 - err / pal >= UMBRAL_ACIERTO) if pal else not textos[fuente]
+            esperado = HORAS_ESPERADAS.get((nombre, fuente))
+            hora = f"{inicios[fuente][0]:.2f} s" if inicios[fuente] else "-"
+            if esperado is not None:
+                hora_ok = bool(inicios[fuente]) and abs(inicios[fuente][0] - esperado) <= TOLERANCIA_HORA
+                hora += f" (esp. {esperado})"
+                ok &= hora_ok
+            # Tras un corte en palabra, la frase siguiente empieza donde quedó el corte (~19-20 s)
+            if nombre == "habla continua 25 s" and len(inicios[fuente]) > 1:
+                ok &= 18.0 <= inicios[fuente][1] <= 21.5
+                hora += f", 2ª {inicios[fuente][1]:.1f} s"
             total_err += err
             total_pal += pal
             fallos += not ok
-            print(f"{nombre:28s} {fuente:6s} {err:8d} {pal:9d}  {'OK' if ok else 'FALLO'}", flush=True)
+            print(f"{nombre:28s} {fuente:6s} {err:8d} {pal:9d} {hora:>16s}  {'OK' if ok else 'FALLO'}", flush=True)
 
     print(f"\nTOTAL errores de palabra: {total_err} de {total_pal} "
           f"({100 * total_err / total_pal:.1f} %) | escenarios con fallo: {fallos} | unitarias con fallo: {len(fallos_unit)}")
