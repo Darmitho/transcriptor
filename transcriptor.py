@@ -62,7 +62,11 @@ SOSP_LOGPROB = -0.5             # Sospechosa con avg_logprob menor: se descarta
 SOSP_NO_VOZ = 0.3               # Sospechosa con no_speech_prob mayor: se descarta
 SOSP_VOZ_MIN = 0.3              # Sospechosa, sola en la frase, con menos voz que esto: se descarta
 
-PROMPT_FIJO = None              # Ej.: "Hola. Esta es una conversación, con puntuación." (None = sin prompt)
+# --- Contexto fijo para Whisper (nunca se alimenta del propio texto transcrito) ---
+# Nombres propios y jerga que Whisper no conoce. Se le pasan como una frase natural y
+# puntuada ("Hoy hablamos de A, B y C."), que en pruebas dio mejor resultado que
+# hotwords o un prompt descriptivo. Mantener la lista corta. () = sin contexto.
+VOCABULARIO = ("Claude", "CriptoBuzz", "pullback", "order block", "RSI")
 
 # Carpeta local (fuera de OneDrive) donde se guardan las transcripciones automáticas
 CARPETA_SALIDA = os.path.expandvars(r"%USERPROFILE%\Documents\Transcripciones")
@@ -111,6 +115,17 @@ def _normalizar(texto):
     t = unicodedata.normalize("NFD", texto.lower())
     t = "".join(c for c in t if unicodedata.category(c) != "Mn")
     return " ".join(re.sub(r"[^\w\s]", " ", t).split())
+
+
+def _prompt_vocabulario(vocabulario):
+    """('A', 'B', 'C') -> 'Hoy hablamos de A, B y C.'"""
+    if not vocabulario:
+        return None
+    lista = ", ".join(vocabulario[:-1]) + " y " + vocabulario[-1] if len(vocabulario) > 1 else vocabulario[0]
+    return f"Hoy hablamos de {lista}."
+
+
+PROMPT = _prompt_vocabulario(VOCABULARIO)
 
 
 def _quitar_solape(previo, nuevo):
@@ -368,6 +383,13 @@ class Motor:
             return "no_voz"
         if s.avg_logprob < MIN_LOGPROB:
             return "logprob"
+        texto = _normalizar(s.text)
+        if PROMPT:
+            prompt = _normalizar(PROMPT)
+            # Whisper repitió buena parte del prompt en vez de transcribir. Exigir al menos
+            # la mitad evita descartar habla real corta como "el order block"
+            if len(texto.split()) >= max(4, len(prompt.split()) // 2) and texto in prompt:
+                return "eco_prompt"
         if _normalizar(s.text) in FRASES_SOSPECHOSAS and (
                 s.avg_logprob < SOSP_LOGPROB or s.no_speech_prob > SOSP_NO_VOZ
                 or (n_segs == 1 and voz_seg < SOSP_VOZ_MIN)):
@@ -389,7 +411,7 @@ class Motor:
             # transcribiendo la cola de silencio (alucina "Gracias..."): no combinarlos
             without_timestamps=not palabras,
             word_timestamps=palabras,
-            initial_prompt=PROMPT_FIJO,
+            initial_prompt=PROMPT,
         )
         segmentos = list(segmentos)
         conservados, descartes = [], Counter()
