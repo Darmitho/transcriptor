@@ -232,7 +232,48 @@ def medidores_y_estado():
     return fallos
 
 
-PRUEBAS = [orden_cronologico, timer_vram, configuracion, letra_y_colores, medidores_y_estado]
+def atajos():
+    """Pulsaciones reales sobre la ventana: Ctrl+Espacio inicia y detiene (no mientras el
+    botón está deshabilitado), Ctrl+M alterna el micrófono, Ctrl +/= y − cambian la letra."""
+    fallos = []
+    with app_aislada():
+        root = tk.Tk()
+        app = T.App(root)
+        llamadas = []
+        app.motor.iniciar = lambda con_mic=False: llamadas.append(("iniciar", con_mic))
+        app.motor.detener = lambda: llamadas.append(("detener",))
+        app.motor.activar_mic = lambda activo: llamadas.append(("mic", activo))
+        root.deiconify()
+        root.focus_force()
+        _esperar(root, 0.3)
+
+        def pulsar(secuencia):
+            app.texto.focus_force()
+            app.texto.event_generate(secuencia)
+            _esperar(root, 0.05)
+
+        pulsar("<Control-space>")           # Botón deshabilitado: el modelo no cargó todavía
+        if llamadas:
+            fallos.append(("inició sin modelo", list(llamadas)))
+        app.cola_ui.put(("modelo_listo", None))
+        app._procesar_cola()
+        pulsar("<Control-space>")
+        pulsar("<Control-m>")
+        pulsar("<Control-space>")
+        if llamadas != [("iniciar", False), ("mic", True), ("detener",)] or not app.mic.get():
+            fallos.append(("iniciar / micrófono / detener", list(llamadas), app.mic.get()))
+        tamano = app.letra.cget("size")
+        pulsar("<Control-equal>")
+        pulsar("<Control-plus>")
+        pulsar("<Control-minus>")
+        if app.letra.cget("size") != tamano + 1:
+            fallos.append(("letra", tamano, app.letra.cget("size")))
+        app._cancelar_timer_vram()
+        root.destroy()
+    return fallos
+
+
+PRUEBAS = [orden_cronologico, timer_vram, configuracion, letra_y_colores, medidores_y_estado, atajos]
 
 
 def todas():

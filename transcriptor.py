@@ -803,6 +803,8 @@ class App:
         tk.Checkbutton(pie, text="Siempre encima", variable=self.encima, command=self._encima,
                        bg=self.FONDO, fg=self.TEXTO, selectcolor="#2b2d31",
                        activebackground=self.FONDO, activeforeground=self.TEXTO).pack(side="right")
+        tk.Label(pie, text="Ctrl+Espacio iniciar/detener · Ctrl+M micrófono · Ctrl +/− letra",
+                 bg=self.FONDO, fg=self.GRIS).pack(side="right", padx=12)
 
         # Fuentes con nombre: cambiar su tamaño actualiza todo el texto que las usa
         self.letra = tkfont.Font(family="Segoe UI", size=self.config["tamano_letra"])
@@ -817,6 +819,7 @@ class App:
         self.texto.mark_gravity("parcial_ini", "left")
         self.texto.configure(state="disabled")
         self.ajustes = None                 # Ventana de ajustes, si está abierta
+        self._enlazar_atajos()
 
         root.protocol("WM_DELETE_WINDOW", self.cerrar)
         self.timer_vram = None              # Liberar la VRAM tras LIBERAR_VRAM_TRAS detenido
@@ -888,6 +891,31 @@ class App:
         self.root.attributes("-topmost", self.encima.get())
         self.config["siempre_encima"] = self.encima.get()
         self.config.guardar()
+
+    # ---------- Atajos de teclado (con la ventana enfocada) ----------
+    ATAJOS = {
+        "iniciar_detener": ("<Control-space>",),
+        "microfono": ("<Control-m>", "<Control-M>"),
+        "letra_mas": ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"),
+        "letra_menos": ("<Control-minus>", "<Control-KP_Subtract>"),
+    }
+
+    def _enlazar_atajos(self):
+        acciones = {"iniciar_detener": self.atajo_iniciar_detener, "microfono": self.atajo_microfono,
+                    "letra_mas": lambda: self.cambiar_letra(+1), "letra_menos": lambda: self.cambiar_letra(-1)}
+        for nombre, secuencias in self.ATAJOS.items():
+            for secuencia in secuencias:
+                # "break": que el atajo no llegue además al widget enfocado
+                self.root.bind_all(secuencia, lambda e, a=acciones[nombre]: (a(), "break")[1])
+
+    def atajo_iniciar_detener(self):
+        """Igual que el botón: no hace nada mientras está deshabilitado (cargando o deteniendo)."""
+        if str(self.btn["state"]) == "normal":
+            self.alternar()
+
+    def atajo_microfono(self):
+        self.mic.set(not self.mic.get())
+        self._alternar_mic()
 
     # ---------- Letra y colores ----------
     def cambiar_letra(self, delta=0, tamano=None):
