@@ -25,7 +25,8 @@ from math import gcd
 MODELO = "large-v3-turbo"       # Si va lento: "medium" o "small"
 DISPOSITIVO = "cuda"
 TIPO_COMPUTO = "int8_float16"   # Bajo uso de VRAM, buena calidad en RTX 3050
-IDIOMA = "es"                   # None = detección automática
+IDIOMAS = {"Español": "es", "English": "en"}  # Opciones del selector de la ventana
+IDIOMA = "es"                   # Idioma al abrir el programa
 SR_MODELO = 16000
 
 INTERVALO_PARCIAL = 1.0         # Cada cuántos segundos se refresca el texto provisional
@@ -57,6 +58,11 @@ FRASES_SOSPECHOSAS = (
     "suscribete",
     "subtitulos realizados por la comunidad de amara org",
     "musica",
+    "thank you",
+    "thanks for watching",
+    "thank you for watching",
+    "please subscribe",
+    "music",
 )
 SOSP_LOGPROB = -0.5             # Sospechosa con avg_logprob menor: se descarta
 SOSP_NO_VOZ = 0.3               # Sospechosa con no_speech_prob mayor: se descarta
@@ -64,8 +70,8 @@ SOSP_VOZ_MIN = 0.3              # Sospechosa, sola en la frase, con menos voz qu
 
 # --- Contexto fijo para Whisper (nunca se alimenta del propio texto transcrito) ---
 # Nombres propios y jerga que Whisper no conoce. Se le pasan como una frase natural y
-# puntuada ("Hoy hablamos de A, B y C."), que en pruebas dio mejor resultado que
-# hotwords o un prompt descriptivo. Mantener la lista corta. () = sin contexto.
+# puntuada en el idioma elegido ("Hoy hablamos de A, B y C."), que en pruebas dio mejor
+# resultado que hotwords o un prompt descriptivo. Mantener la lista corta. () = sin contexto.
 VOCABULARIO = ("Claude", "CriptoBuzz", "pullback", "order block", "RSI")
 
 # Carpeta local (fuera de OneDrive) donde se guardan las transcripciones automáticas
@@ -117,15 +123,17 @@ def _normalizar(texto):
     return " ".join(re.sub(r"[^\w\s]", " ", t).split())
 
 
-def _prompt_vocabulario(vocabulario):
-    """('A', 'B', 'C') -> 'Hoy hablamos de A, B y C.'"""
+# Frase del prompt y conjunción por idioma: un prompt en otro idioma empuja a traducir
+PLANTILLAS_PROMPT = {"es": ("Hoy hablamos de {}.", " y "), "en": ("Today we are talking about {}.", " and ")}
+
+
+def _prompt_vocabulario(vocabulario, idioma):
+    """('A', 'B', 'C'), 'es' -> 'Hoy hablamos de A, B y C.'"""
     if not vocabulario:
         return None
-    lista = ", ".join(vocabulario[:-1]) + " y " + vocabulario[-1] if len(vocabulario) > 1 else vocabulario[0]
-    return f"Hoy hablamos de {lista}."
-
-
-PROMPT = _prompt_vocabulario(VOCABULARIO)
+    frase, y = PLANTILLAS_PROMPT[idioma]
+    lista = ", ".join(vocabulario[:-1]) + y + vocabulario[-1] if len(vocabulario) > 1 else vocabulario[0]
+    return frase.format(lista)
 
 
 def _quitar_solape(previo, nuevo):
@@ -278,6 +286,12 @@ class Motor:
         self.pa = None
         self.fuentes = []
         self.hilo = None
+        self.cambiar_idioma(IDIOMA)
+
+    def cambiar_idioma(self, idioma):
+        """Se puede llamar en marcha desde la UI: aplica desde la próxima transcripción.
+        Idioma y prompt van en una sola tupla para que el hilo nunca lea uno sin el otro."""
+        self.contexto = (idioma, _prompt_vocabulario(VOCABULARIO, idioma))
 
     # ---------- Modelo ----------
     def cargar_modelo(self):
@@ -399,7 +413,7 @@ class Motor:
                 self.cola_ui.put(("error_mic", str(e)))
 
     # ---------- Transcripción ----------
-    def _motivo_descarte(self, s, n_segs, voz_seg):
+    def _motivo_descarte(self, s, n_segs, voz_seg, prompt=None):
         """Devuelve por qué se descarta un segmento de Whisper, o None si se conserva."""
         if s.compression_ratio > MAX_COMPRESION:
             return "compresion"
@@ -408,13 +422,13 @@ class Motor:
         if s.avg_logprob < MIN_LOGPROB:
             return "logprob"
         texto = _normalizar(s.text)
-        if PROMPT:
-            prompt = _normalizar(PROMPT)
+        if prompt:
+            prompt = _normalizar(prompt)
             # Whisper repitió buena parte del prompt en vez de transcribir. Exigir al menos
             # la mitad evita descartar habla real corta como "el order block"
             if len(texto.split()) >= max(4, len(prompt.split()) // 2) and texto in prompt:
                 return "eco_prompt"
-        if _normalizar(s.text) in FRASES_SOSPECHOSAS and (
+        if texto in FRASES_SOSPECHOSAS and (
                 s.avg_logprob < SOSP_LOGPROB or s.no_speech_prob > SOSP_NO_VOZ
                 or (n_segs == 1 and voz_seg < SOSP_VOZ_MIN)):
             return "sospechosa"
@@ -423,11 +437,12 @@ class Motor:
     def _transcribir(self, fuente, trozos, final, voz_seg, palabras=False):
         """Devuelve (texto, segmentos conservados). Con palabras=True incluye sus tiempos."""
         t0 = time.perf_counter()
+        idioma, prompt = self.contexto
         audio = np.concatenate(trozos)
         audio = resample_poly(audio, fuente.up, fuente.down).astype(np.float32)
         segmentos, _ = self.modelo.transcribe(
             audio,
-            language=IDIOMA,
+            language=idioma,
             beam_size=5 if final else 1,
             vad_filter=False,               # El VAD propio ya decidió que hay voz
             condition_on_previous_text=False,
@@ -435,12 +450,12 @@ class Motor:
             # transcribiendo la cola de silencio (alucina "Gracias..."): no combinarlos
             without_timestamps=not palabras,
             word_timestamps=palabras,
-            initial_prompt=PROMPT,
+            initial_prompt=prompt,
         )
         segmentos = list(segmentos)
         conservados, descartes = [], Counter()
         for s in segmentos:
-            motivo = self._motivo_descarte(s, len(segmentos), voz_seg)
+            motivo = self._motivo_descarte(s, len(segmentos), voz_seg, prompt)
             if motivo:
                 descartes[motivo] += 1
             else:
@@ -450,8 +465,8 @@ class Motor:
         # Solo métricas, nunca el texto (puede ser información de clientes)
         seg_audio = len(audio) / SR_MODELO
         dt = time.perf_counter() - t0
-        log.info("%-7s [%s] audio %5.1fs voz %4.1fs -> %.2fs (RTF %.2f) cola=%d segs %d/%d%s",
-                 "final" if final else "parcial", fuente.nombre, seg_audio, voz_seg, dt,
+        log.info("%-7s [%s] %s audio %5.1fs voz %4.1fs -> %.2fs (RTF %.2f) cola=%d segs %d/%d%s",
+                 "final" if final else "parcial", fuente.nombre, idioma, seg_audio, voz_seg, dt,
                  dt / max(seg_audio, 1e-6), self.cola_audio.qsize(), len(conservados), len(segmentos),
                  "".join(f" {k}={v}" for k, v in descartes.items()))
         return " ".join(s.text.strip() for s in conservados).strip(), conservados
@@ -626,6 +641,12 @@ class App:
         self.btn_reconectar = tk.Button(barra, text="🔄 Reconectar", command=self.reconectar,
                                         state="disabled", **estilo)
         self.btn_reconectar.pack(side="left")
+        # Idioma que se habla en el audio (no traduce): aplica desde la próxima frase
+        self.idioma = tk.StringVar(value=next(n for n, c in IDIOMAS.items() if c == IDIOMA))
+        menu = tk.OptionMenu(barra, self.idioma, *IDIOMAS, command=self._cambiar_idioma)
+        menu.configure(highlightthickness=0, **estilo)
+        menu["menu"].configure(bg="#2b2d31", fg=self.TEXTO, activebackground="#3a3d43")
+        menu.pack(side="left", padx=4)
         self.encima = tk.BooleanVar(value=True)
         tk.Checkbutton(barra, text="Siempre encima", variable=self.encima, command=self._encima,
                        bg=self.FONDO, fg=self.TEXTO, selectcolor="#2b2d31",
@@ -672,6 +693,10 @@ class App:
         except Exception as e:
             messagebox.showerror("Error de audio",
                                  f"{e}\n\nRevisa el dispositivo de salida en Windows y pulsa Reconectar otra vez.")
+
+    def _cambiar_idioma(self, nombre):
+        self.motor.cambiar_idioma(IDIOMAS[nombre])
+        self.estado.configure(text=f"Idioma: {nombre}")
 
     def _alternar_mic(self):
         """Con la captura detenida solo se recuerda la elección; en marcha se aplica al tiro."""
