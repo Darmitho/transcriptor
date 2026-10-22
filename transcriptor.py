@@ -374,6 +374,30 @@ class Motor:
             self.stop.set()
         self.cola_ui.put(("estado", "Deteniendo..."))
 
+    def reconectar(self, con_mic):
+        """Vuelve a abrir la captura con los dispositivos predeterminados actuales de Windows
+        (p. ej. tras conectar audífonos), sin detener el hilo ni recargar el modelo.
+        Se llama desde la UI."""
+        if self.pa is None:
+            return
+        # Las fuentes actuales se retiran: el hilo transcribe lo que alcanzó a llegar
+        for f in self.fuentes:
+            if not f.retirar:
+                f.cerrar_stream()
+                f.retirar = True
+        # PortAudio solo enumera los dispositivos al iniciarse: hay que reiniciarlo
+        self.pa.terminate()
+        self.pa = pyaudio.PyAudio()
+        otros = Fuente(NOMBRE_OTROS, self._dispositivo_loopback(), self.cola_audio)
+        otros.abrir(self.pa)
+        self.fuentes.append(otros)
+        self.cola_ui.put(("estado", f"Reconectado: {otros.disp['name']}"))
+        if con_mic:
+            try:
+                self.activar_mic(True)
+            except Exception as e:          # Sin micrófono se sigue con el audio del PC
+                self.cola_ui.put(("error_mic", str(e)))
+
     # ---------- Transcripción ----------
     def _motivo_descarte(self, s, n_segs, voz_seg):
         """Devuelve por qué se descarta un segmento de Whisper, o None si se conserva."""
@@ -598,6 +622,10 @@ class App:
         tk.Checkbutton(barra, text="🎤 Micrófono", variable=self.mic, command=self._alternar_mic,
                        indicatoron=False, selectcolor="#2f6f3e", offrelief="flat",
                        **estilo).pack(side="left", padx=4)
+        # Tras conectar audífonos u otro dispositivo: toma los predeterminados actuales de Windows
+        self.btn_reconectar = tk.Button(barra, text="🔄 Reconectar", command=self.reconectar,
+                                        state="disabled", **estilo)
+        self.btn_reconectar.pack(side="left")
         self.encima = tk.BooleanVar(value=True)
         tk.Checkbutton(barra, text="Siempre encima", variable=self.encima, command=self._encima,
                        bg=self.FONDO, fg=self.TEXTO, selectcolor="#2b2d31",
@@ -623,6 +651,7 @@ class App:
         if self.activo:
             # El botón se reactiva cuando el hilo termina la última frase ("detenido")
             self.btn.configure(state="disabled")
+            self.btn_reconectar.configure(state="disabled")
             self.activo = False
             self.motor.detener()
         else:
@@ -632,7 +661,17 @@ class App:
                 messagebox.showerror("Error de audio", str(e))
                 return
             self.btn.configure(text="■ Detener")
+            self.btn_reconectar.configure(state="normal")
             self.activo = True
+
+    def reconectar(self):
+        if not self.activo:
+            return
+        try:
+            self.motor.reconectar(con_mic=self.mic.get())
+        except Exception as e:
+            messagebox.showerror("Error de audio",
+                                 f"{e}\n\nRevisa el dispositivo de salida en Windows y pulsa Reconectar otra vez.")
 
     def _alternar_mic(self):
         """Con la captura detenida solo se recuerda la elección; en marcha se aplica al tiro."""
@@ -667,6 +706,7 @@ class App:
             return
         self.cerrando = True
         self.btn.configure(state="disabled")
+        self.btn_reconectar.configure(state="disabled")
         if self.activo:
             self.activo = False
             self.motor.detener()
