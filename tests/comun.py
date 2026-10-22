@@ -5,6 +5,8 @@ import sys
 import time
 import wave
 import difflib
+import tempfile
+import contextlib
 
 import numpy as np
 from scipy.signal import resample_poly
@@ -25,6 +27,21 @@ PARTES = [
     "la reunión siguiente será el martes a las diez",
 ]
 REF_FRASE = "Buenos días a todos. Hoy vamos a revisar el presupuesto del proyecto y las fechas de entrega."
+
+
+@contextlib.contextmanager
+def app_aislada(sin_modelo=True):
+    """Para crear la ventana (App) en pruebas o mediciones sin tocar las transcripciones
+    ni la configuración reales. Con sin_modelo no carga Whisper. Devuelve la carpeta temporal."""
+    carpeta = tempfile.mkdtemp(prefix="prueba_")
+    antes = (T.CARPETA_SALIDA, T.CONFIG_ARCHIVO, T.Motor.cargar_modelo)
+    T.CARPETA_SALIDA, T.CONFIG_ARCHIVO = carpeta, os.path.join(carpeta, "config.json")
+    if sin_modelo:
+        T.Motor.cargar_modelo = lambda self: None
+    try:
+        yield carpeta
+    finally:
+        T.CARPETA_SALIDA, T.CONFIG_ARCHIVO, T.Motor.cargar_modelo = antes
 
 
 def wav(nombre, recortar=False):

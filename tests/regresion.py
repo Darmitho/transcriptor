@@ -16,6 +16,7 @@ import numpy as np
 
 from comun import (T, DISP, PARTES, REF_FRASE, wav, silencio, texto_continuo,
                    frases_con_pausas, errores_palabras, alimentar)
+import pruebas_ventana
 
 UMBRAL_ACIERTO = 0.95                   # Mínimo de palabras correctas por fuente y escenario
 
@@ -106,78 +107,6 @@ def pruebas_unitarias(motor):
     return len(casos) + len(otros), fallos
 
 
-def prueba_ventana():
-    """Frases que llegan fuera de orden: la ventana, Guardar y el .txt quedan cronológicos,
-    y Limpiar no borra nada del .txt. No carga el modelo."""
-    import tempfile
-    import tkinter as tk
-    cargar, carpeta = T.Motor.cargar_modelo, T.CARPETA_SALIDA
-    T.Motor.cargar_modelo, T.CARPETA_SALIDA = (lambda self: None), tempfile.mkdtemp(prefix="regresion_")
-    try:
-        root = tk.Tk()
-        app = T.App(root)
-        base = time.time()
-        for fuente, texto, seg in [("Otros", "Segunda.", 10), ("Yo", "Primera.", 5),
-                                   ("Otros", "Cuarta.", 30), ("Yo", "Tercera.", 20)]:
-            app.cola_ui.put(("final", (fuente, texto, base + seg)))
-        app.cola_ui.put(("parcial", ("Otros", "provisional")))
-        app._procesar_cola()
-        ventana = app.texto.get("1.0", "end-1c").splitlines()
-        with open(app.archivo_auto, encoding="utf-8") as f:
-            archivo = f.read().splitlines()
-        app.limpiar()
-        app.cola_ui.put(("final", ("Yo", "Quinta.", base + 40)))
-        app._procesar_cola()
-        with open(app.archivo_auto, encoding="utf-8") as f:
-            tras_limpiar = f.read().splitlines()
-        root.destroy()
-    finally:
-        T.Motor.cargar_modelo, T.CARPETA_SALIDA = cargar, carpeta
-    orden = ["Primera.", "Segunda.", "Tercera.", "Cuarta."]
-    hora = lambda s: time.strftime("%H:%M:%S", time.localtime(base + s))
-    fallos = []
-    if [l.split(": ", 1)[-1] for l in ventana[:4]] != orden or ventana[4] != "Otros: provisional":
-        fallos.append(("ventana", ventana))
-    if [l.split(": ", 1)[-1] for l in archivo] != orden or not archivo[0].startswith(f"[{hora(5)}] Yo:"):
-        fallos.append(("archivo", archivo))
-    if len(tras_limpiar) != 5:
-        fallos.append(("Limpiar borró líneas del .txt", tras_limpiar))
-    return fallos
-
-
-def prueba_timer_vram():
-    """La ventana pide liberar la VRAM tras LIBERAR_VRAM_TRAS detenido, y no si se inicia antes."""
-    import tempfile
-    import tkinter as tk
-    cargar, carpeta, espera = T.Motor.cargar_modelo, T.CARPETA_SALIDA, T.LIBERAR_VRAM_TRAS
-    T.Motor.cargar_modelo, T.CARPETA_SALIDA = (lambda self: None), tempfile.mkdtemp(prefix="regresion_")
-    T.LIBERAR_VRAM_TRAS = 0.2
-    try:
-        root = tk.Tk()
-        app = T.App(root)
-        llamadas = []
-        app.motor.liberar_vram = lambda: llamadas.append(time.time()) or True
-        app.cola_ui.put(("modelo_listo", None))
-        app._procesar_cola()
-
-        def esperar(segundos):
-            fin = time.time() + segundos
-            while time.time() < fin:
-                root.update()
-                time.sleep(0.02)
-
-        esperar(0.5)
-        tras_espera = len(llamadas)
-        app._programar_liberar_vram()   # Vuelve a quedar detenido...
-        app._cancelar_timer_vram()      # ...pero se inicia antes de que venza
-        esperar(0.5)
-        tras_cancelar = len(llamadas)
-        root.destroy()
-    finally:
-        T.Motor.cargar_modelo, T.CARPETA_SALIDA, T.LIBERAR_VRAM_TRAS = cargar, carpeta, espera
-    return [] if (tras_espera, tras_cancelar) == (1, 1) else [("timer VRAM", tras_espera, tras_cancelar)]
-
-
 def prueba_recarga(motor, velocidad):
     """Liberar la VRAM baja el uso de la GPU, y al volver a escuchar el modelo se recarga
     sin perder la frase que empezó durante la recarga."""
@@ -205,12 +134,12 @@ def main():
     ap.add_argument("--velocidad", type=float, default=1.0, help="1.0 = tiempo real (lo representativo)")
     args = ap.parse_args()
 
-    fallos_unit = prueba_ventana() + prueba_timer_vram()
+    n_ventana, fallos_unit = pruebas_ventana.todas()   # Sin modelo: primero, son rápidas
     motor = T.Motor(queue.Queue())
     motor.cargar_modelo()
     n_unit, f_unit = pruebas_unitarias(motor)
     fallos_unit += f_unit
-    n_unit += 2                         # + la ventana y el temporizador de la VRAM
+    n_unit += n_ventana
     print(f"\nunitarias: {n_unit - len(fallos_unit)}/{n_unit} OK")
     for f in fallos_unit:
         print("  FALLO:", f)

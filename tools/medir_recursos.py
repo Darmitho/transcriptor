@@ -187,7 +187,8 @@ def main():
         print(f"AVISO: otros procesos usan la GPU {otros}: los tiempos y la VRAM no serán representativos")
     base = {"vram": pynvml.nvmlDeviceGetMemoryInfo(gpu).used / 2**20, "ram": psutil.Process().memory_info().rss / 2**20}
 
-    T.CARPETA_SALIDA = tempfile.mkdtemp(prefix="medicion_")   # No tocar las transcripciones reales
+    carpeta = tempfile.mkdtemp(prefix="medicion_")         # No tocar transcripciones ni configuración reales
+    T.CARPETA_SALIDA, T.CONFIG_ARCHIVO = carpeta, os.path.join(carpeta, "config.json")
     listo = threading.Event()
     cargar = T.Motor.cargar_modelo
 

@@ -16,6 +16,7 @@ import bisect
 import logging
 import threading
 import time
+import json
 import datetime
 import unicodedata
 from collections import Counter, deque
@@ -84,6 +85,10 @@ MODO_OFFLINE = True
 # Tras estos segundos detenido se libera la VRAM del modelo (~900 MB) y se recarga al
 # iniciar (~5 s, sin perder audio: espera en la cola). None = mantenerlo siempre en la GPU.
 LIBERAR_VRAM_TRAS = 300
+# Preferencias de la ventana (idioma, tamaño, colores...): local, fuera de OneDrive.
+# El micrófono no se recuerda a propósito: siempre arranca apagado.
+CONFIG_ARCHIVO = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+                              "Transcriptor", "config.json")
 # =============================================================
 
 if MODO_OFFLINE:
@@ -642,13 +647,68 @@ class Motor:
             self.cola_ui.put(("detenido", None))
 
 
+class Configuracion(dict):
+    """Preferencias de la ventana guardadas entre sesiones en CONFIG_ARCHIVO.
+    Un archivo dañado o con valores de otro tipo no impide abrir: se usan los valores iniciales."""
+
+    INICIAL = {"idioma": IDIOMA, "siempre_encima": True, "geometria": "760x440"}
+
+    def __init__(self, ruta=None):
+        super().__init__(self.INICIAL)
+        self.ruta = ruta or CONFIG_ARCHIVO
+        try:
+            with open(self.ruta, encoding="utf-8") as f:
+                guardada = json.load(f)
+            for clave, valor in guardada.items():
+                inicial = self.INICIAL.get(clave)
+                # Solo claves conocidas y del mismo tipo (un int sirve donde se espera float)
+                if clave in self.INICIAL and (type(valor) is type(inicial)
+                                              or (type(inicial) is float and type(valor) is int)):
+                    self[clave] = valor
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, AttributeError) as e:
+            log.warning("Configuración ilegible (%s): se usan los valores iniciales", e)
+
+    def guardar(self):
+        try:
+            os.makedirs(os.path.dirname(self.ruta), exist_ok=True)
+            tmp = self.ruta + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.ruta)
+        except OSError as e:
+            log.error("No se pudo guardar la configuración: %s", e)
+
+
+def _geometria_visible(geometria):
+    """La geometría guardada solo si su esquina queda dentro de las pantallas actuales
+    (un monitor desconectado dejaría la ventana fuera de la vista)."""
+    m = re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)", geometria)
+    if not m:
+        return geometria if re.fullmatch(r"\d+x\d+", geometria) else Configuracion.INICIAL["geometria"]
+    x, y = int(m.group(3)), int(m.group(4))
+    try:
+        import ctypes
+        u = ctypes.windll.user32       # Escritorio virtual: todos los monitores juntos
+        x0, y0, ancho, alto = (u.GetSystemMetrics(i) for i in (76, 77, 78, 79))
+    except (AttributeError, OSError):
+        return geometria
+    dentro = x0 <= x < x0 + ancho - 100 and y0 <= y < y0 + alto - 50
+    return geometria if dentro else f"{m.group(1)}x{m.group(2)}"
+
+
 class App:
     FONDO, TEXTO, GRIS, ACENTO = "#1e1f22", "#e8e8e8", "#8a8d93", "#6ea8fe"
 
     def __init__(self, root):
         self.root = root
+        self.config = Configuracion()
+        if self.config["idioma"] not in IDIOMAS.values():
+            self.config["idioma"] = IDIOMA
         self.cola_ui = queue.Queue()
         self.motor = Motor(self.cola_ui)
+        self.motor.cambiar_idioma(self.config["idioma"])
         # Frases finales (inicio, hora, fuente, texto) ordenadas por inicio del habla:
         # las de la ventana (Limpiar las borra) y las de la sesión (van al .txt automático)
         self.finales, self.registro = [], []
@@ -664,9 +724,9 @@ class App:
         self.archivo_auto = os.path.join(CARPETA_SALIDA, nombre)
 
         root.title("Transcriptor en vivo")
-        root.geometry("760x440")
+        root.geometry(_geometria_visible(self.config["geometria"]))
         root.configure(bg=self.FONDO)
-        root.attributes("-topmost", True)
+        root.attributes("-topmost", self.config["siempre_encima"])
 
         barra = tk.Frame(root, bg=self.FONDO)
         barra.pack(fill="x", padx=8, pady=6)
@@ -685,12 +745,12 @@ class App:
                                         state="disabled", **estilo)
         self.btn_reconectar.pack(side="left")
         # Idioma que se habla en el audio (no traduce): aplica desde la próxima frase
-        self.idioma = tk.StringVar(value=next(n for n, c in IDIOMAS.items() if c == IDIOMA))
+        self.idioma = tk.StringVar(value=next(n for n, c in IDIOMAS.items() if c == self.config["idioma"]))
         menu = tk.OptionMenu(barra, self.idioma, *IDIOMAS, command=self._cambiar_idioma)
         menu.configure(highlightthickness=0, **estilo)
         menu["menu"].configure(bg="#2b2d31", fg=self.TEXTO, activebackground="#3a3d43")
         menu.pack(side="left", padx=4)
-        self.encima = tk.BooleanVar(value=True)
+        self.encima = tk.BooleanVar(value=self.config["siempre_encima"])
         tk.Checkbutton(barra, text="Siempre encima", variable=self.encima, command=self._encima,
                        bg=self.FONDO, fg=self.TEXTO, selectcolor="#2b2d31",
                        activebackground=self.FONDO, activeforeground=self.TEXTO).pack(side="left", padx=8)
@@ -757,6 +817,8 @@ class App:
 
     def _cambiar_idioma(self, nombre):
         self.motor.cambiar_idioma(IDIOMAS[nombre])
+        self.config["idioma"] = IDIOMAS[nombre]
+        self.config.guardar()
         self.estado.configure(text=f"Idioma: {nombre}")
 
     def _alternar_mic(self):
@@ -771,6 +833,8 @@ class App:
 
     def _encima(self):
         self.root.attributes("-topmost", self.encima.get())
+        self.config["siempre_encima"] = self.encima.get()
+        self.config.guardar()
 
     def limpiar(self):
         self.finales.clear()
@@ -791,6 +855,9 @@ class App:
         if self.cerrando:
             return
         self.cerrando = True
+        if self.root.state() == "normal":   # Minimizada o maximizada: se guarda la última normal
+            self.config["geometria"] = self.root.geometry()
+        self.config.guardar()
         self.btn.configure(state="disabled")
         self.btn_reconectar.configure(state="disabled")
         if self.activo:
