@@ -361,8 +361,108 @@ def atajo_global():
     return fallos
 
 
+class TraductorFalso:
+    """Imita a T.Traductor sin modelo: guarda los pedidos y responde cuando la prueba quiere,
+    en el orden que quiera. Con falla=True avisa que no hay modelo, como el real."""
+    instancias = []
+
+    def __init__(self, cola_ui, ruta=None, falla=False):
+        self.cola_ui, self.falla, self.pedidos, self.vivo = cola_ui, falla, [], False
+        TraductorFalso.instancias.append(self)
+
+    def start(self):
+        self.vivo = True
+        if self.falla:
+            self.cola_ui.put(("error_traduccion", "falta el modelo"))
+
+    def pedir(self, clave, texto):
+        self.pedidos.append((clave, texto))
+
+    def responder(self, *indices):
+        for i in indices:
+            clave, texto = self.pedidos[i]
+            self.cola_ui.put(("traduccion", (clave, f"ES({texto})")))
+
+    def detener(self):
+        self.vivo = False
+
+
+def traduccion():
+    """Solo finales y solo con el audio en inglés; traducciones fuera de orden y frases que se
+    insertan en medio quedan en su lugar; tres vistas en ventana y franja; .txt con ambas."""
+    from tkinter import messagebox
+    fallos = []
+    real, aviso = T.Traductor, messagebox.showerror
+    T.Traductor = TraductorFalso
+    messagebox.showerror = lambda *a, **k: None
+    TraductorFalso.instancias.clear()
+    try:
+        with app_aislada():
+            root = tk.Tk()
+            app = T.App(root)
+            lineas = lambda: app.texto.get("1.0", "end-1c").splitlines()
+            sin_hora = lambda ls: [l.split("  ", 1)[-1] if l[:2].isdigit() else l for l in ls]
+            app._cambiar_idioma("English")
+            app.cambiar_vista_traduccion("Original + traducción")
+            tr = TraductorFalso.instancias[-1]
+            base = time.time()
+            app.cola_ui.put(("final", ("Otros", "Second.", base + 10)))
+            app.cola_ui.put(("final", ("Otros", "Third.", base + 20)))
+            app.cola_ui.put(("parcial", ("Otros", "fourth in progress")))
+            app._procesar_cola()
+            app.cola_ui.put(("final", ("Yo", "First.", base + 5)))     # Llega tarde: va al principio
+            app._procesar_cola()
+            tr.responder(1, 2, 0)           # Traducciones fuera de orden
+            app._procesar_cola()
+            esperado = ["Yo: First.", "    → ES(First.)", "Otros: Second.", "    → ES(Second.)",
+                        "Otros: Third.", "    → ES(Third.)", "Otros: fourth in progress"]
+            if sin_hora(lineas()) != esperado or len(tr.pedidos) != 3:
+                fallos.append(("ambos", sin_hora(lineas()), len(tr.pedidos)))
+            if "traduccion" not in app.texto.tag_names("2.6"):
+                fallos.append(("cursiva", app.texto.tag_names("2.6")))
+            with open(app.archivo_auto, encoding="utf-8") as f:
+                txt = [l.split("] ", 1)[1] for l in f.read().splitlines()]
+            if txt != ["Yo: First.", "Yo (es): ES(First.)", "Otros: Second.", "Otros (es): ES(Second.)",
+                       "Otros: Third.", "Otros (es): ES(Third.)"]:
+                fallos.append(("txt", txt))
+
+            app.cambiar_vista_traduccion("Solo traducción")
+            if sin_hora(lineas())[:3] != ["Yo: ES(First.)", "Otros: ES(Second.)", "Otros: ES(Third.)"]:
+                fallos.append(("solo", sin_hora(lineas())))
+            app.config["franja_lineas"] = 3
+            app.alternar_subtitulos(True)
+            franja = app.texto_franja.get("1.0", "end-1c").splitlines()
+            app.cambiar_vista_traduccion("Original + traducción")
+            franja_ambos = app.texto_franja.get("1.0", "end-1c").splitlines()
+            app.alternar_subtitulos(False)
+            if franja != ["Otros: ES(Second.)", "Otros: ES(Third.)", "Otros: fourth in progress"] or \
+                    franja_ambos != ["Otros: Third.", "→ ES(Third.)", "Otros: fourth in progress"]:
+                fallos.append(("franja", franja, franja_ambos))
+
+            app._cambiar_idioma("Español")  # Audio en español: no se pide traducción
+            app.cola_ui.put(("final", ("Otros", "Cuarta.", base + 30)))
+            app._procesar_cola()
+            if len(tr.pedidos) != 3:
+                fallos.append(("tradujo con el audio en español", tr.pedidos))
+
+            app.cambiar_vista_traduccion("Sin traducir")
+            if tr.vivo or app.traductor is not None or "→" in app.texto.get("1.0", "end"):
+                fallos.append(("apagar", tr.vivo, app.traductor))
+
+            # Sin modelo: avisa y vuelve a "Sin traducir"
+            T.Traductor = lambda cola, ruta=None: TraductorFalso(cola, falla=True)
+            app.cambiar_vista_traduccion("Solo traducción")
+            app._procesar_cola()
+            if app.config["traduccion"] != "no" or app.vista.get() != "Sin traducir":
+                fallos.append(("sin modelo", app.config["traduccion"], app.vista.get()))
+            root.destroy()
+    finally:
+        T.Traductor, messagebox.showerror = real, aviso
+    return fallos
+
+
 PRUEBAS = [orden_cronologico, timer_vram, configuracion, letra_y_colores, medidores_y_estado, atajos,
-           subtitulos, atajo_global]
+           subtitulos, atajo_global, traduccion]
 
 
 def todas():

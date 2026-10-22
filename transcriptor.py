@@ -81,7 +81,8 @@ VOCABULARIO = ("Claude", "CriptoBuzz", "pullback", "order block", "RSI")
 # Opus-MT en-es (Apache-2.0) sobre CTranslate2, en CPU para no quitarle GPU a Whisper.
 # Se convierte una vez con tools\convertir_traduccion.md y luego funciona sin red.
 MODELO_TRADUCCION = os.path.join(os.path.expanduser("~"), ".cache", "transcriptor", "traduccion", "opus-mt-en-es")
-TRADUCCION_HILOS = 4                # Núcleos de CPU para traducir (~0.1 s por frase)
+TRADUCCION_HILOS = 1                # 1 hilo: ~0.2 s por frase y ~10 % de un núcleo; con 4, ~0.1 s pero ~50 %
+                                    # (los hilos de OpenMP quedan girando en espera entre frases)
 # Términos que quedan en inglés al traducir, además de los de VOCABULARIO
 NO_TRADUCIR = ("stop loss",)
 
@@ -756,6 +757,30 @@ class Traductor(threading.Thread):
         self.pendientes.put((None, None))
 
 
+class Frase:
+    """Una frase final, tal como la muestran la ventana y la franja y la guarda el .txt.
+    La traducción llega después (otro hilo), por eso es mutable."""
+
+    __slots__ = ("inicio", "hora", "fuente", "texto", "traduccion", "marca")
+
+    def __init__(self, inicio, fuente, texto):
+        self.inicio, self.fuente, self.texto = inicio, fuente, texto
+        # Hora en que empezó a hablarse, no en que terminó de transcribirse
+        self.hora = datetime.datetime.fromtimestamp(inicio).strftime("%H:%M:%S")
+        self.traduccion = None
+        self.marca = None                   # Marca de Tk donde empieza en la ventana
+
+    def lineas_txt(self):
+        lineas = [f"[{self.hora}] {self.fuente}: {self.texto}"]
+        if self.traduccion:
+            lineas.append(f"[{self.hora}] {self.fuente} (es): {self.traduccion}")
+        return lineas
+
+
+# Vistas de la traducción en el selector de la ventana -> valor guardado en la configuración
+VISTAS_TRADUCCION = {"Sin traducir": "no", "Original + traducción": "ambos", "Solo traducción": "solo"}
+
+
 class Configuracion(dict):
     """Preferencias de la ventana guardadas entre sesiones en CONFIG_ARCHIVO.
     Un archivo dañado o con valores de otro tipo no impide abrir: se usan los valores iniciales."""
@@ -765,7 +790,9 @@ class Configuracion(dict):
                # Franja de subtítulos
                "franja_tamano": 22, "franja_lineas": 2, "franja_opacidad": 0.9, "franja_posicion": "abajo",
                # Atajo de todo el sistema para entrar y salir de los subtítulos ("" = sin atajo global)
-               "atajo_subtitulos": "Ctrl+Shift+S"}
+               "atajo_subtitulos": "Ctrl+Shift+S",
+               # Traducción inglés -> español: "no", "ambos" (original + traducción) o "solo"
+               "traduccion": "no"}
     LETRA_MIN, LETRA_MAX = 9, 36
     FRANJA_LINEAS_MAX = 4
 
@@ -909,12 +936,17 @@ class App:
         self.config["franja_lineas"] = max(1, min(Configuracion.FRANJA_LINEAS_MAX, self.config["franja_lineas"]))
         self.config["franja_opacidad"] = max(0.3, min(1.0, self.config["franja_opacidad"]))
         self.config["franja_tamano"] = max(12, min(48, self.config["franja_tamano"]))
+        if self.config["traduccion"] not in VISTAS_TRADUCCION.values():
+            self.config["traduccion"] = "no"
         self.cola_ui = queue.Queue()
         self.motor = Motor(self.cola_ui)
         self.motor.cambiar_idioma(self.config["idioma"])
         # Frases finales (inicio, hora, fuente, texto) ordenadas por inicio del habla:
         # las de la ventana (Limpiar las borra) y las de la sesión (van al .txt automático)
-        self.finales, self.registro = [], []
+        self.finales, self.registro = [], []    # Listas de Frase
+        self.traductor = None               # Se carga al activar la traducción
+        self.por_traducir = {}              # Clave del pedido -> Frase que espera su traducción
+        self.n_marcas = self.n_pedidos = 0
         self.parciales = {}                 # Texto provisional por fuente
         self.activo = False
         self.cerrando = False
@@ -953,6 +985,13 @@ class App:
         menu.configure(highlightthickness=0, **estilo)
         menu["menu"].configure(bg="#2b2d31", fg=self.TEXTO, activebackground="#3a3d43")
         menu.pack(side="left", padx=4)
+        # Traducción al español de las frases finales (cuando el idioma del audio es English)
+        self.vista = tk.StringVar(value=next(n for n, v in VISTAS_TRADUCCION.items()
+                                             if v == self.config["traduccion"]))
+        menu = tk.OptionMenu(barra, self.vista, *VISTAS_TRADUCCION, command=self.cambiar_vista_traduccion)
+        menu.configure(highlightthickness=0, **estilo)
+        menu["menu"].configure(bg="#2b2d31", fg=self.TEXTO, activebackground="#3a3d43")
+        menu.pack(side="left")
         self.subtitulos = tk.BooleanVar(value=False)
         tk.Checkbutton(barra, text="CC Subtítulos", variable=self.subtitulos,
                        command=lambda: self.alternar_subtitulos(self.subtitulos.get()),
@@ -1001,6 +1040,9 @@ class App:
         self.texto.pack(fill="both", expand=True)
         self.texto.tag_config("parcial", foreground=self.GRIS)
         self.texto.tag_config("hora", foreground=self.ACENTO, font=self.letra_hora)
+        self.letra_traduccion = tkfont.Font(family="Segoe UI", size=self.config["tamano_letra"], slant="italic")
+        self.texto.tag_config("traduccion", font=self.letra_traduccion)
+        self._sangria_traduccion()
         self._aplicar_colores()
         self.texto.mark_set("parcial_ini", "1.0")
         self.texto.mark_gravity("parcial_ini", "left")
@@ -1137,6 +1179,9 @@ class App:
                                     relief="flat", borderwidth=0, highlightthickness=0, padx=16, pady=8)
         self.texto_franja.pack(fill="both", expand=True)
         self.texto_franja.tag_config("parcial", foreground=self.GRIS)
+        self.letra_franja_traduccion = tkfont.Font(family="Segoe UI", size=self.config["franja_tamano"],
+                                                   slant="italic")
+        self.texto_franja.tag_config("traduccion", font=self.letra_franja_traduccion)
         for fuente, clave in ((NOMBRE_YO, "color_yo"), (NOMBRE_OTROS, "color_otros")):
             self.texto_franja.tag_config(f"hablante_{fuente}", foreground=self.config[clave])
         self._ubicar_franja()
@@ -1162,7 +1207,15 @@ class App:
         """Las últimas frases (finales y provisionales) que caben en la franja."""
         if self.franja is None:
             return
-        lineas = [(f"{fuente}: {t}", f"hablante_{fuente}") for _, _, fuente, t in self.finales]
+        vista, lineas = self.config["traduccion"], []
+        for frase in self.finales:
+            hablante = f"hablante_{frase.fuente}"
+            if vista == "solo" and frase.traduccion:
+                lineas.append((f"{frase.fuente}: {frase.traduccion}", hablante))
+                continue
+            lineas.append((f"{frase.fuente}: {frase.texto}", hablante))
+            if vista == "ambos" and frase.traduccion:
+                lineas.append((f"→ {frase.traduccion}", (hablante, "traduccion")))
         lineas += [(f"{fuente}: {t}", "parcial") for fuente, t in self.parciales.items() if t]
         t = self.texto_franja
         t.configure(state="normal")
@@ -1179,14 +1232,21 @@ class App:
         if self.franja is not None:
             self.franja.attributes("-alpha", self.config["franja_opacidad"])
             self.letra_franja.configure(size=self.config["franja_tamano"])
+            self.letra_franja_traduccion.configure(size=self.config["franja_tamano"])
             self._ubicar_franja()
             self._actualizar_franja()
+
+    def _sangria_traduccion(self):
+        """Si una traducción ocupa varias líneas, las siguientes quedan alineadas tras la flecha."""
+        self.texto.tag_config("traduccion", lmargin2=self.letra_traduccion.measure("    → "))
 
     # ---------- Letra y colores ----------
     def cambiar_letra(self, delta=0, tamano=None):
         tamano = tamano if tamano is not None else self.config["tamano_letra"] + delta
         tamano = max(Configuracion.LETRA_MIN, min(Configuracion.LETRA_MAX, int(tamano)))
         self.letra.configure(size=tamano)
+        self.letra_traduccion.configure(size=tamano)
+        self._sangria_traduccion()
         self.letra_hora.configure(size=max(8, tamano - 4))
         self.config["tamano_letra"] = tamano
         self.config.guardar()
@@ -1265,6 +1325,8 @@ class App:
         tk.Button(v, text="Cerrar", command=v.destroy, **self.estilo).grid(row=9, column=0, columnspan=2, pady=(12, 0))
 
     def limpiar(self):
+        for frase in self.finales:
+            self.texto.mark_unset(frase.marca)
         self.finales.clear()
         self.parciales.clear()
         self.texto.configure(state="normal")
@@ -1278,7 +1340,7 @@ class App:
                                             filetypes=[("Texto", "*.txt")])
         if ruta:
             with open(ruta, "w", encoding="utf-8") as f:
-                f.write("\n".join(f"[{h}] {fuente}: {t}" for _, h, fuente, t in self.finales))
+                f.write("\n".join(l for frase in self.finales for l in frase.lineas_txt()))
 
     def cerrar(self):
         if self.cerrando:
@@ -1305,6 +1367,7 @@ class App:
             self.destruida = True
             if self.atajo_global is not None:
                 self.atajo_global.detener()
+            self._detener_traductor()
             self.root.destroy()
 
     # ---------- Actualización de la ventana ----------
@@ -1365,6 +1428,12 @@ class App:
                     self._agregar_final(valor)
                 elif tipo == "atajo" and valor == "subtitulos":
                     self.alternar_subtitulos()
+                elif tipo == "traduccion":
+                    self._recibir_traduccion(valor)
+                elif tipo == "error_traduccion":
+                    self.traductor = None
+                    self.cambiar_vista_traduccion("Sin traducir")
+                    messagebox.showerror("Traducción", valor)
                 elif tipo == "error_mic":
                     self.mic.set(False)
                     messagebox.showerror("Error de micrófono",
@@ -1404,23 +1473,114 @@ class App:
     def _agregar_final(self, valor):
         fuente, s, inicio = valor
         self.parciales[fuente] = ""
-        # Hora en que empezó a hablarse, no en que terminó de transcribirse. Con dos
-        # fuentes solapadas una frase puede llegar después de otra que empezó más tarde:
-        # se inserta en su lugar cronológico
-        hora = datetime.datetime.fromtimestamp(inicio).strftime("%H:%M:%S")
-        frase = (inicio, hora, fuente, s)
-        bisect.insort_right(self.registro, frase, key=lambda f: f[0])
+        # Con dos fuentes solapadas una frase puede llegar después de otra que empezó más
+        # tarde: se inserta en su lugar cronológico
+        frase = Frase(inicio, fuente, s)
+        bisect.insort_right(self.registro, frase, key=lambda f: f.inicio)
         self._guardar_registro()
-        pos = bisect.bisect_right(self.finales, inicio, key=lambda f: f[0])
+        pos = bisect.bisect_right(self.finales, inicio, key=lambda f: f.inicio)
         self.finales.insert(pos, frase)
-        self.texto.configure(state="normal")
-        self.texto.delete("parcial_ini", "end-1c")   # "end" borraría también el último salto de línea
-        linea = pos + 1                     # Cada frase final ocupa una línea del texto
-        self.texto.insert(f"{linea}.0", f"{hora}  ", "hora")
-        self.texto.insert(f"{linea}.{len(hora) + 2}", f"{fuente}: {s}\n", f"hablante_{fuente}")
-        self.texto.mark_set("parcial_ini", "end-1c")
-        self.texto.configure(state="disabled")
-        self._mostrar_parciales()           # Parciales de otras fuentes, debajo del final
+        self._dibujar_frase(pos, nueva=True)
+        self._actualizar_franja()
+        self._pedir_traduccion(frase)
+
+    # ---------- Frases finales en la ventana ----------
+    def _segmentos(self, frase):
+        """Texto y etiquetas de una frase según la vista de traducción, para Text.insert."""
+        hablante = f"hablante_{frase.fuente}"
+        vista = self.config["traduccion"]
+        texto = frase.traduccion if vista == "solo" and frase.traduccion else frase.texto
+        segmentos = [f"{frase.hora}  ", "hora", f"{frase.fuente}: {texto}\n", hablante]
+        if vista == "ambos" and frase.traduccion:
+            segmentos += [f"    → {frase.traduccion}\n", (hablante, "traduccion")]
+        return segmentos
+
+    def _dibujar_frase(self, pos, nueva):
+        """Inserta (nueva) o vuelve a dibujar la frase pos de self.finales. Cada frase
+        empieza en una marca propia: así ocupa una o dos líneas sin descuadrar las demás."""
+        t = self.texto
+        frase = self.finales[pos]
+        fin = self.finales[pos + 1].marca if pos + 1 < len(self.finales) else "parcial_ini"
+        t.configure(state="normal")
+        t.delete("parcial_ini", "end-1c")   # Lo provisional se vuelve a poner al final
+        if nueva:
+            frase.marca = f"frase_{self.n_marcas}"
+            self.n_marcas += 1
+            inicio = t.index(fin)
+        else:
+            inicio = t.index(frase.marca)
+            t.delete(inicio, fin)
+        t.insert(inicio, *self._segmentos(frase))
+        # Gravedad derecha: si luego se inserta otra frase justo antes, la marca se corre con su texto
+        t.mark_set(frase.marca, inicio)
+        t.mark_gravity(frase.marca, "right")
+        t.mark_set("parcial_ini", "end-1c")
+        t.configure(state="disabled")
+        self._mostrar_parciales()           # Parciales debajo de la última frase
+
+    def _redibujar(self):
+        """Todo de nuevo (al cambiar la vista de traducción)."""
+        t = self.texto
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        for frase in self.finales:
+            t.mark_unset(frase.marca)
+            frase.marca = f"frase_{self.n_marcas}"
+            self.n_marcas += 1
+            inicio = t.index("end-1c")
+            t.insert(inicio, *self._segmentos(frase))
+            t.mark_set(frase.marca, inicio)
+            t.mark_gravity(frase.marca, "right")
+        t.mark_set("parcial_ini", "end-1c")
+        t.configure(state="disabled")
+        self._mostrar_parciales()
+
+    # ---------- Traducción ----------
+    def cambiar_vista_traduccion(self, nombre):
+        vista = VISTAS_TRADUCCION[nombre]
+        self.vista.set(nombre)
+        self.config["traduccion"] = vista
+        self.config.guardar()
+        if vista == "no":
+            self._detener_traductor()       # Libera su RAM (~100 MB); volver a cargarlo tarda 0.2 s
+        else:
+            self._asegurar_traductor()
+            if self.motor.contexto[0] != "en":
+                self.estado.configure(text="La traducción se aplica cuando el idioma es English")
+        self._redibujar()
+        self._actualizar_franja()
+
+    def _asegurar_traductor(self):
+        if self.traductor is None:
+            self.traductor = Traductor(self.cola_ui)
+            self.traductor.start()
+
+    def _detener_traductor(self):
+        if self.traductor is not None:
+            self.traductor.detener()
+            self.traductor = None
+
+    def _pedir_traduccion(self, frase):
+        """Solo frases finales y solo si el audio es inglés: los parciales no se traducen."""
+        if self.config["traduccion"] == "no" or self.motor.contexto[0] != "en":
+            return
+        self._asegurar_traductor()
+        self.n_pedidos += 1
+        self.por_traducir[self.n_pedidos] = frase
+        self.traductor.pedir(self.n_pedidos, frase.texto)
+
+    def _recibir_traduccion(self, valor):
+        clave, traduccion = valor
+        frase = self.por_traducir.pop(clave, None)
+        if frase is None:
+            return
+        frase.traduccion = traduccion
+        self._guardar_registro()
+        for pos, f in enumerate(self.finales):  # Puede no estar: Limpiar la quitó de la ventana
+            if f is frase:
+                if self.config["traduccion"] != "no":
+                    self._dibujar_frase(pos, nueva=False)
+                break
         self._actualizar_franja()
 
     def _guardar_registro(self):
@@ -1429,7 +1589,7 @@ class App:
         tmp = self.archivo_auto + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
-                f.writelines(f"[{h}] {fuente}: {t}\n" for _, h, fuente, t in self.registro)
+                f.writelines(l + "\n" for frase in self.registro for l in frase.lineas_txt())
             os.replace(tmp, self.archivo_auto)
         except OSError as e:
             log.error("No se pudo guardar %s: %s", self.archivo_auto, e)

@@ -99,7 +99,10 @@ class Medicion:
         self.app, self.motor, self.mu = app, app.motor, muestreador
         self.transcripciones = []       # (fuente, final, audio_s, segundos)
         self.finales = []               # (perf_counter, fuente) cuando el texto llega a la ventana
+        self.t_final = {}               # id de la Frase -> perf_counter al llegar a la ventana
+        self.traducciones = []          # segundos entre el texto final y su traducción en la ventana
         transcribir, agregar = self.motor._transcribir, app._agregar_final
+        recibir = app._recibir_traduccion
 
         def _transcribir(fuente, trozos, final, voz_seg, palabras=False):
             t0 = time.perf_counter()
@@ -110,14 +113,25 @@ class Medicion:
 
         def _agregar_final(valor):
             self.finales.append((time.perf_counter(), valor[0]))
-            return agregar(valor)
+            r = agregar(valor)
+            for frase in app.registro:          # La recién llegada: la única sin hora registrada
+                self.t_final.setdefault(id(frase), time.perf_counter())
+            return r
+
+        def _recibir_traduccion(valor):
+            frase = app.por_traducir.get(valor[0])
+            r = recibir(valor)
+            if frase is not None and id(frase) in self.t_final:
+                self.traducciones.append(time.perf_counter() - self.t_final[id(frase)])
+            return r
 
         self.motor._transcribir = _transcribir
         app._agregar_final = _agregar_final
+        app._recibir_traduccion = _recibir_traduccion
 
     def escenario(self, nombre, pistas=None, fines=None, segundos=None):
         print(f"  midiendo: {nombre}...", flush=True)
-        self.transcripciones, self.finales = [], []
+        self.transcripciones, self.finales, self.traducciones = [], [], []
         self.mu.medir()
         enviados = {}
         t_inicio = time.perf_counter()
@@ -160,6 +174,9 @@ class Medicion:
         r["latencia_prom"] = statistics.fmean(latencias) if latencias else 0.0
         r["latencia_p95"] = p95(latencias)
         r["latencia_max"] = max(latencias, default=0.0)
+        r["traduccion_n"] = len(self.traducciones)
+        r["traduccion_prom"] = statistics.fmean(self.traducciones) if self.traducciones else 0.0
+        r["traduccion_max"] = max(self.traducciones, default=0.0)
         # Si la ventana deja de procesar eventos (p. ej. mientras se arrastra), los finales
         # llegan tarde o nunca y la corrida no sirve: se marca para descartarla
         r["duracion_s"] = time.perf_counter() - t_inicio
@@ -185,6 +202,8 @@ def main():
     ap.add_argument("--escenarios", default="detenido,silencio,una_fuente,dos_fuentes",
                     help="Lista separada por comas: para repetir solo los que interesan")
     ap.add_argument("--subtitulos", action="store_true", help="Medir con la franja de subtítulos visible")
+    ap.add_argument("--traduccion", choices=["no", "ambos", "solo"], default="no",
+                    help="Vista de traducción durante la medición (afecta al escenario 'ingles')")
     args = ap.parse_args()
 
     pynvml.nvmlInit()
@@ -227,9 +246,15 @@ def main():
                                                     fines={"Otros": fines_a}),
                 "dos_fuentes": lambda: med.escenario("dos fuentes hablando", pistas={"Otros": otros_a, "Yo": yo_b},
                                                      fines={"Otros": fines_a, "Yo": fines_b}),
+                "ingles": lambda: med.escenario("una fuente en inglés", pistas={"Otros": ingles},
+                                                fines={"Otros": fines_ingles}),
             }
+            ingles, fines_ingles = secuencia(["en1", "en2", "en3", "en4"] * 2)
             for nombre in pedidos:
+                # Audio en inglés: el motor transcribe en inglés (y se traduce si la vista lo pide)
+                app.motor.cambiar_idioma("en" if nombre == "ingles" else "es")
                 resultados[nombre] = guiones[nombre]()
+            app.motor.cambiar_idioma("es")
         finally:
             terminado.set()
 
@@ -241,6 +266,9 @@ def main():
 
     if args.subtitulos:
         root.after(500, lambda: app.alternar_subtitulos(True))
+    if args.traduccion != "no":
+        nombre = next(n for n, v in T.VISTAS_TRADUCCION.items() if v == args.traduccion)
+        root.after(500, lambda: app.cambiar_vista_traduccion(nombre))
     threading.Thread(target=guion, daemon=True).start()
     root.after(200, revisar_fin)
     root.mainloop()
@@ -251,6 +279,7 @@ def main():
                                 capture_output=True, text=True).stdout.strip())
     datos = {"fecha": datetime.datetime.now().isoformat(timespec="seconds"), "etiqueta": args.etiqueta,
              "commit": commit + ("+cambios" if sucio else ""), "otros_procesos_gpu": otros,
+             "traduccion": args.traduccion,
              "nucleos": psutil.cpu_count(), "base_antes_de_cargar": base, "escenarios": resultados}
     os.makedirs(os.path.join(RAIZ, "mediciones"), exist_ok=True)
     ruta = os.path.join(RAIZ, "mediciones", f"{datetime.datetime.now():%Y%m%d_%H%M}_{args.etiqueta}.json")
@@ -267,8 +296,11 @@ def main():
         ("Latencia fin de habla -> texto (prom / p95 / máx s)",
          lambda r: f"{r['latencia_prom']:.2f} / {r['latencia_p95']:.2f} / {r['latencia_max']:.2f}" if r["latencia_n"] else "-"),
         ("Atraso máx de la cola por fuente (s)", lambda r: f"{r['cola_max_s']:.1f}"),
+        ("Traducción: n, tras el final (prom / máx s)",
+         lambda r: f"{r['traduccion_n']}, {r['traduccion_prom']:.2f} / {r['traduccion_max']:.2f}"
+         if r.get("traduccion_n") else "-"),
     ]
-    cols = [c for c in ("detenido", "silencio", "una_fuente", "dos_fuentes") if c in resultados]
+    cols = [c for c in ("detenido", "silencio", "una_fuente", "dos_fuentes", "ingles") if c in resultados]
     print(f"\n{'':52s}" + "".join(f"{c:>20s}" for c in cols))
     for etiqueta, f in filas:
         print(f"{etiqueta:52s}" + "".join(f"{f(resultados[c]):>20s}" for c in cols))

@@ -112,7 +112,7 @@ UMBRAL_CHRF_TRADUCCION = 79.5           # Medido: 80.5 con términos protegidos 
 
 def pruebas_traduccion():
     """Protección de términos (sin modelo) y traductor real: calidad, términos intactos y
-    velocidad. Sin el modelo instalado se omite con aviso (se convierte aparte, no está en el repo)."""
+    velocidad (< 500 ms por frase con 1 hilo). Sin el modelo instalado se omite con aviso (se convierte aparte, no está en el repo)."""
     import os
     import queue as q
     import statistics
@@ -150,7 +150,7 @@ def pruebas_traduccion():
     mediana = statistics.median(tiempos) * 1000
     print(f"  traducción: chrF {chrf:.1f} (mín. {UMBRAL_CHRF_TRADUCCION}) | {len(terminos)} frases con términos, "
           f"{len(perdidos)} los perdieron | {mediana:.0f} ms por frase")
-    if chrf < UMBRAL_CHRF_TRADUCCION or perdidos or mediana > 300:
+    if chrf < UMBRAL_CHRF_TRADUCCION or perdidos or mediana > 500:   # 1 hilo: ~0.2-0.25 s
         fallos.append(("traductor", round(chrf, 1), perdidos, round(mediana)))
     return 3, fallos
 
