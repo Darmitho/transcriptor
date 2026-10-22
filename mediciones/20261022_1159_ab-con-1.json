@@ -1,0 +1,33 @@
+{
+  "fecha": "2026-10-22T11:59:19",
+  "etiqueta": "ab-con-1",
+  "commit": "0027e6d+cambios",
+  "otros_procesos_gpu": [],
+  "nucleos": 16,
+  "base_antes_de_cargar": {
+    "vram": 132.0,
+    "ram": 132.99609375
+  },
+  "escenarios": {
+    "dos_fuentes": {
+      "cpu_prom": 73.125,
+      "cpu_max": 131.1,
+      "ram_prom": 801.7151264391447,
+      "ram_max": 806.89453125,
+      "vram_max": 1272.50390625,
+      "gpu_prom": 65.17105263157895,
+      "gpu_max": 100,
+      "cola_max_s": 2.0,
+      "parcial_n": 76,
+      "parcial_rtf_prom": 0.25398120484898695,
+      "parcial_seg_p95": 0.7157231000019237,
+      "final_n": 22,
+      "final_rtf_prom": 0.1288964627276927,
+      "final_seg_p95": 0.8922264000284486,
+      "latencia_n": 20,
+      "latencia_prom": 1.8589442400028928,
+      "latencia_p95": 2.1972645000205375,
+      "latencia_max": 2.2401613000547513
+    }
+  }
+}

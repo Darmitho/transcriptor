@@ -2,7 +2,10 @@
 
 Uso:  venv\\Scripts\\python.exe tools\\medir_recursos.py --etiqueta linea-base
 Tarda unos 5 minutos. Guarda los resultados en mediciones\\<fecha>_<etiqueta>.json.
-Conviene correrlo con la GPU libre: avisa si otro proceso la está usando.
+Conviene correrlo con la GPU libre (avisa si otro proceso la usa) y sin tocar la ventana:
+arrastrarla bloquea sus eventos y la corrida se marca como no válida.
+Para comparar dos versiones: --escenarios dos_fuentes, varias corridas de cada una
+(entre corridas hay ±0.15 s de latencia y ±3 puntos de CPU de ruido).
 
 Escenarios: detenido (modelo cargado) · escuchando en silencio · una fuente hablando ·
 dos fuentes hablando a la vez (Yo y Otros, muy solapadas: el peor caso).
@@ -117,6 +120,8 @@ class Medicion:
         self.transcripciones, self.finales = [], []
         self.mu.medir()
         enviados = {}
+        t_inicio = time.perf_counter()
+        esperado = segundos or 0
         if pistas is None:
             time.sleep(segundos)
         else:
@@ -126,6 +131,7 @@ class Medicion:
             m.fuentes = list(fuentes.values())
             m.hilo = threading.Thread(target=m._bucle, args=(m.stop, m.cola_audio, m.fuentes), daemon=True)
             m.hilo.start()
+            esperado = max(len(a) for a in pistas.values()) / 48000 + 3.0
             enviados = alimentar(pistas, fuentes, m.cola_audio, fines_voz=fines)
             time.sleep(3.0)             # Margen para que lleguen los últimos finales
             m.stop.set()
@@ -148,6 +154,13 @@ class Medicion:
         r["latencia_prom"] = statistics.fmean(latencias) if latencias else 0.0
         r["latencia_p95"] = p95(latencias)
         r["latencia_max"] = max(latencias, default=0.0)
+        # Si la ventana deja de procesar eventos (p. ej. mientras se arrastra), los finales
+        # llegan tarde o nunca y la corrida no sirve: se marca para descartarla
+        r["duracion_s"] = time.perf_counter() - t_inicio
+        r["valida"] = r["duracion_s"] <= esperado * 1.3 + 2 and (not fines or r["latencia_n"] > 0)
+        if not r["valida"]:
+            print(f"  AVISO: corrida no válida ({r['duracion_s']:.0f} s, esperado ~{esperado:.0f} s, "
+                  f"{r['latencia_n']} latencias): no tocar la ventana mientras se mide")
         return r
 
 
@@ -163,6 +176,8 @@ def otros_procesos_gpu():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--etiqueta", default="medicion")
+    ap.add_argument("--escenarios", default="detenido,silencio,una_fuente,dos_fuentes",
+                    help="Lista separada por comas: para repetir solo los que interesan")
     args = ap.parse_args()
 
     pynvml.nvmlInit()
@@ -196,12 +211,17 @@ def main():
             yo_b, fines_b = secuencia(["v5", "parte3", "v4", "frase", "parte4", "v1", "v3", "continuo", "v2"])
             yo_b = np.concatenate([silencio(1.5), yo_b])
             fines_b = [f + int(1.5 * 48000) for f in fines_b]
-            resultados["detenido"] = med.escenario("detenido (modelo cargado)", segundos=15)
-            resultados["silencio"] = med.escenario("escuchando en silencio", pistas={"Otros": silencio(20)})
-            resultados["una_fuente"] = med.escenario("una fuente hablando", pistas={"Otros": otros_a},
-                                                     fines={"Otros": fines_a})
-            resultados["dos_fuentes"] = med.escenario("dos fuentes hablando", pistas={"Otros": otros_a, "Yo": yo_b},
-                                                      fines={"Otros": fines_a, "Yo": fines_b})
+            pedidos = args.escenarios.split(",")
+            guiones = {
+                "detenido": lambda: med.escenario("detenido (modelo cargado)", segundos=15),
+                "silencio": lambda: med.escenario("escuchando en silencio", pistas={"Otros": silencio(20)}),
+                "una_fuente": lambda: med.escenario("una fuente hablando", pistas={"Otros": otros_a},
+                                                    fines={"Otros": fines_a}),
+                "dos_fuentes": lambda: med.escenario("dos fuentes hablando", pistas={"Otros": otros_a, "Yo": yo_b},
+                                                     fines={"Otros": fines_a, "Yo": fines_b}),
+            }
+            for nombre in pedidos:
+                resultados[nombre] = guiones[nombre]()
         finally:
             terminado.set()
 
@@ -238,10 +258,10 @@ def main():
          lambda r: f"{r['latencia_prom']:.2f} / {r['latencia_p95']:.2f} / {r['latencia_max']:.2f}" if r["latencia_n"] else "-"),
         ("Atraso máx de la cola por fuente (s)", lambda r: f"{r['cola_max_s']:.1f}"),
     ]
-    cols = ["detenido", "silencio", "una_fuente", "dos_fuentes"]
+    cols = [c for c in ("detenido", "silencio", "una_fuente", "dos_fuentes") if c in resultados]
     print(f"\n{'':52s}" + "".join(f"{c:>20s}" for c in cols))
     for etiqueta, f in filas:
-        print(f"{etiqueta:52s}" + "".join(f"{f(resultados[c]):>20s}" for c in cols if c in resultados))
+        print(f"{etiqueta:52s}" + "".join(f"{f(resultados[c]):>20s}" for c in cols))
     print(f"\nbase antes de cargar el modelo: RAM {base['ram']:.0f} MB, VRAM usada por todo el equipo {base['vram']:.0f} MB")
     print("guardado en", ruta)
 
