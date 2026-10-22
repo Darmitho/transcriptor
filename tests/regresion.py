@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from comun import (T, DISP, PARTES, REF_FRASE, wav, silencio, texto_continuo,
+from comun import (T, DISP, PARTES, REF_FRASE, wav, silencio, texto_continuo, ruido_rosa, musica_sintetica,
                    frases_con_pausas, errores_palabras, alimentar)
 import pruebas_ventana
 
@@ -93,10 +93,17 @@ def pruebas_unitarias(motor):
         (seg(" sí sí sí sí", cr=3.0), 1, 2.0, None, "compresion"),
         (seg(" " + prompt), 1, 3.0, prompt, "eco_prompt"),
         (seg(" el order block y RSI"), 1, 2.0, prompt, None),
+        (seg(" Closed Captioning by CriptoBuzz"), 1, 2.0, None, "credito"),
+        (seg(" Subtítulos realizados por la comunidad de Amara.org"), 1, 2.0, None, "credito"),
+        (seg(" The captions are on, can everyone read them?"), 1, 2.0, None, None),
     ]
     fallos = [(s.text, esperado, r) for s, n, v, p, esperado in casos
               if (r := motor._motivo_descarte(s, n, v, p)) != esperado]
     otros = [
+        (T._corregir("Welcome to CryptoBus, crypto boss and Crypto Buzz, not cryptocurrency"),
+         "Welcome to CriptoBuzz, CriptoBuzz and CriptoBuzz, not cryptocurrency"),
+        (T._oraciones("What's he doing? He looks like a zombie. Okay"), ["What's he doing?", "He looks like a zombie.", "Okay"]),
+        (T.Motor(None).contexto[1] if not T.USAR_PROMPT_VOCABULARIO else None, None),
         (T._quitar_solape("sin afectar a los", "los usuarios que ya"), "usuarios que ya"),
         (T._quitar_solape("hola mundo", "otra cosa"), "otra cosa"),
         (T._prompt_vocabulario(("A", "B", "C"), "es"), "Hoy hablamos de A, B y C."),
@@ -152,7 +159,40 @@ def pruebas_traduccion():
           f"{len(perdidos)} los perdieron | {mediana:.0f} ms por frase")
     if chrf < UMBRAL_CHRF_TRADUCCION or perdidos or mediana > 500:   # 1 hilo: ~0.2-0.25 s
         fallos.append(("traductor", round(chrf, 1), perdidos, round(mediana)))
-    return 3, fallos
+    # Varias oraciones juntas: la primera, corta, no se pierde (antes "What's he doing?" desaparecía)
+    tr = T.Traductor(q.Queue())
+    tr.start()
+    tr.listo.wait(60)
+    for en, debe in (("What's he doing? He looks like a zombie.", "qué está haciendo"),
+                     ("Get down! They are coming through the door.", "al suelo")):
+        es = tr.traducir(en)
+        if T._normalizar(debe) not in T._normalizar(es):
+            fallos.append(("primera oración perdida", en, es))
+    tr.detener()
+    return 4, fallos
+
+
+def prueba_sin_vocabulario_inventado(motor):
+    """Música y ruido sin voz, sin el VAD (el peor caso), en inglés y español: ninguna palabra
+    del VOCABULARIO debe aparecer. Con el prompt de vocabulario activo, Whisper las inventaba."""
+    import re
+    from scipy.signal import resample_poly
+    fondos = [musica_sintetica(s, i) for i, s in enumerate((2, 3.5, 5))] + \
+             [ruido_rosa(s, i) for i, s in enumerate((2, 3.5, 5))]
+    inventadas = []
+    for idioma in ("es", "en"):
+        motor.cambiar_idioma(idioma)
+        _, prompt = motor.contexto
+        for audio in fondos:
+            a16 = resample_poly(audio, 1, 3).astype(np.float32)
+            segs = list(motor.modelo.transcribe(a16, language=idioma, beam_size=5, vad_filter=False,
+                                                without_timestamps=True, condition_on_previous_text=False,
+                                                initial_prompt=prompt)[0])
+            texto = " ".join(s.text for s in segs if motor._motivo_descarte(s, len(segs), 1.0, prompt) is None)
+            if any(re.search(r"\b" + re.escape(t.lower()) + r"\b", texto.lower()) for t in T.VOCABULARIO):
+                inventadas.append((idioma, texto[:80]))
+    motor.cambiar_idioma(T.IDIOMA)
+    return [("vocabulario inventado", inventadas)] if inventadas else []
 
 
 def prueba_recarga(motor, velocidad):
@@ -189,6 +229,8 @@ def main():
     fallos_unit += f_unit
     n_unit += n_ventana
     n_trad, f_trad = pruebas_traduccion()
+    f_trad += prueba_sin_vocabulario_inventado(motor)
+    n_trad += 1
     n_unit += n_trad
     fallos_unit += f_trad
     print(f"\nunitarias: {n_unit - len(fallos_unit)}/{n_unit} OK")

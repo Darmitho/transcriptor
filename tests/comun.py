@@ -63,6 +63,32 @@ def silencio(segundos):
     return np.zeros(int(TASA * segundos), np.float32)
 
 
+def ruido_rosa(segundos, semilla=0):
+    """Ruido de banda ancha, parecido a efectos, multitud o lluvia."""
+    n = int(TASA * segundos)
+    espectro = np.fft.rfft(np.random.default_rng(semilla).standard_normal(n))
+    espectro /= np.sqrt(np.maximum(np.fft.rfftfreq(n, 1 / TASA), 20))
+    x = np.fft.irfft(espectro, n)
+    return (x / np.sqrt(np.mean(x ** 2)) * 0.03).astype(np.float32)
+
+
+def musica_sintetica(segundos, semilla=0):
+    """Acordes con armónicos, bajo, bombo y platillo: un fondo musical simple."""
+    rng = np.random.default_rng(semilla)
+    t = np.arange(int(TASA * segundos)) / TASA
+    x = np.zeros_like(t)
+    acordes = [(220, 277, 330), (196, 247, 294), (175, 220, 262), (165, 208, 247)]
+    for k in range(int(segundos // 2) + 1):
+        ac, m = acordes[k % 4], (t >= k * 2) & (t < (k + 1) * 2)
+        for f in ac:
+            for h, a in ((1, 1.0), (2, 0.5), (3, 0.25)):
+                x[m] += a * np.sin(2 * np.pi * f * h * t[m])
+        x[m] += 1.5 * np.sin(2 * np.pi * ac[0] / 2 * t[m])
+    x += ((t % 0.5) < 0.05) * np.sin(2 * np.pi * 60 * t) * 3 * np.exp(-(t % 0.5) * 40)
+    x += ((t % 0.25) < 0.02) * rng.standard_normal(len(t)) * 0.8
+    return (x / np.sqrt(np.mean(x ** 2)) * 0.03).astype(np.float32)
+
+
 def texto_continuo():
     with open(os.path.join(AUDIO, "continuo.txt"), encoding="utf-8-sig") as f:
         return f.read().strip()

@@ -54,6 +54,10 @@ MAX_COMPRESION = 2.4            # compression_ratio mayor = texto repetitivo en 
 MAX_NO_VOZ = 0.8                # no_speech_prob mayor = el modelo cree que no hay voz
 MIN_LOGPROB = -1.0              # avg_logprob menor = confianza muy baja
 # Frases típicas de alucinación: solo se descartan si además hay señales de duda
+# Créditos que Whisper inventa al final de un video o con música ("Closed Captioning by...").
+# Nunca son habla real: se descartan siempre (sobre el texto normalizado, sin tildes)
+CREDITOS_INVENTADOS = re.compile(r"^(closed )?caption(s|ing|ed)? by|^subtitles? by|^transcri(bed|ption) by|"
+                                 r"^subtitulos? (realizados )?por|^traduccion (realizada )?por")
 FRASES_SOSPECHOSAS = (
     "gracias",
     "muchas gracias",
@@ -71,11 +75,19 @@ SOSP_LOGPROB = -0.5             # Sospechosa con avg_logprob menor: se descarta
 SOSP_NO_VOZ = 0.3               # Sospechosa con no_speech_prob mayor: se descarta
 SOSP_VOZ_MIN = 0.3              # Sospechosa, sola en la frase, con menos voz que esto: se descarta
 
-# --- Contexto fijo para Whisper (nunca se alimenta del propio texto transcrito) ---
-# Nombres propios y jerga que Whisper no conoce. Se le pasan como una frase natural y
-# puntuada en el idioma elegido ("Hoy hablamos de A, B y C."), que en pruebas dio mejor
-# resultado que hotwords o un prompt descriptivo. Mantener la lista corta. () = sin contexto.
+# --- Vocabulario propio: nombres y jerga ---
+# No se traducen (ver NO_TRADUCIR). Opcionalmente también se le dan a Whisper como contexto.
 VOCABULARIO = ("Claude", "CriptoBuzz", "pullback", "order block", "RSI")
+# Darle el vocabulario a Whisper como prompt ("Hoy hablamos de A, B y C."). Desactivado: con
+# música o ruido Whisper lo repite como texto inventado (medido sin VAD: 6 de 60 trozos difíciles
+# en español, 2 de 60 en inglés; sin prompt, 0) y con voz clara no mejoró la precisión.
+USAR_PROMPT_VOCABULARIO = False
+# Correcciones de escritura conocidas, sin riesgo de inventar texto: patrón (sin distinguir
+# mayúsculas, palabra completa) -> forma correcta. Se aplican a todo lo transcrito.
+CORRECCIONES = {
+    r"crypto ?bu[sz]+": "CriptoBuzz",
+    r"crypto ?boss": "CriptoBuzz",
+}
 
 # --- Traducción inglés -> español de las frases finales (opcional) ---
 # Opus-MT en-es (Apache-2.0) sobre CTranslate2, en CPU para no quitarle GPU a Whisper.
@@ -154,6 +166,22 @@ def _prompt_vocabulario(vocabulario, idioma):
     frase, y = PLANTILLAS_PROMPT[idioma]
     lista = ", ".join(vocabulario[:-1]) + y + vocabulario[-1] if len(vocabulario) > 1 else vocabulario[0]
     return frase.format(lista)
+
+
+_PATRONES_CORRECCION = [(re.compile(r"\b" + p + r"\b", re.IGNORECASE), r) for p, r in CORRECCIONES.items()]
+
+
+def _corregir(texto):
+    """Aplica CORRECCIONES (escritura de nombres propios que Whisper no conoce)."""
+    for patron, reemplazo in _PATRONES_CORRECCION:
+        texto = patron.sub(reemplazo, texto)
+    return texto
+
+
+def _oraciones(texto):
+    """'What? No. Wait!' -> ['What?', 'No.', 'Wait!']. El traductor pierde a veces la primera
+    oración corta si recibe varias juntas: se traducen por separado, en una sola llamada."""
+    return [o for o in re.split(r"(?<=[.!?¿¡])\s+", texto.strip()) if o]
 
 
 def _proteger_terminos(texto, terminos):
@@ -350,7 +378,7 @@ class Motor:
     def cambiar_idioma(self, idioma):
         """Se puede llamar en marcha desde la UI: aplica desde la próxima transcripción.
         Idioma y prompt van en una sola tupla para que el hilo nunca lea uno sin el otro."""
-        self.contexto = (idioma, _prompt_vocabulario(VOCABULARIO, idioma))
+        self.contexto = (idioma, _prompt_vocabulario(VOCABULARIO, idioma) if USAR_PROMPT_VOCABULARIO else None)
 
     # ---------- Modelo ----------
     def cargar_modelo(self):
@@ -507,6 +535,8 @@ class Motor:
             # la mitad evita descartar habla real corta como "el order block"
             if len(texto.split()) >= max(4, len(prompt.split()) // 2) and texto in prompt:
                 return "eco_prompt"
+        if CREDITOS_INVENTADOS.match(texto):
+            return "credito"
         if texto in FRASES_SOSPECHOSAS and (
                 s.avg_logprob < SOSP_LOGPROB or s.no_speech_prob > SOSP_NO_VOZ
                 or (n_segs == 1 and voz_seg < SOSP_VOZ_MIN)):
@@ -613,7 +643,7 @@ class Motor:
             self.cola_ui.put(("parcial", (fuente.nombre, "")))
             fuente.stats["frases"] += 1
             if texto:
-                self.cola_ui.put(("final", (fuente.nombre, texto, fuente.inicio_voz())))
+                self.cola_ui.put(("final", (fuente.nombre, _corregir(texto), fuente.inicio_voz())))
         finally:
             fuente.reiniciar_frase(*resto)
 
@@ -623,7 +653,7 @@ class Motor:
         if voz_seg >= VOZ_MIN:
             ini, fin = self._recortar(fuente.voz)
             texto = self._transcribir(fuente, fuente.trozos[ini:fin], False, voz_seg)[0]
-            self.cola_ui.put(("parcial", (fuente.nombre, texto)))
+            self.cola_ui.put(("parcial", (fuente.nombre, _corregir(texto))))
         fuente.ultimo_parcial = time.time()
 
     def _bucle(self, stop, cola_audio, fuentes):
@@ -736,19 +766,21 @@ class Traductor(threading.Thread):
             except Exception as e:
                 log.error("Error al traducir: %s", e)
 
-    def _traducir_tal_cual(self, texto):
-        piezas = self.sp_origen.encode(texto, out_type=str) + ["</s>"]
-        r = self.modelo.translate_batch([piezas], beam_size=4)
-        return self.sp_destino.decode(r[0].hypotheses[0])
+    def _traducir_lote(self, textos):
+        piezas = [self.sp_origen.encode(t, out_type=str) + ["</s>"] for t in textos]
+        return [self.sp_destino.decode(r.hypotheses[0]) for r in self.modelo.translate_batch(piezas, beam_size=4)]
 
     def traducir(self, texto):
-        """Con los términos protegidos; si el modelo deformó algún marcador, sin protegerlos."""
-        marcado, usados = _proteger_terminos(texto, self.terminos)
-        if usados:
-            restaurado = _restaurar_terminos(self._traducir_tal_cual(marcado), usados)
-            if restaurado is not None:
-                return restaurado
-        return self._traducir_tal_cual(texto)
+        """Oración por oración (en un solo lote) y con los términos protegidos; si el modelo
+        deformó algún marcador, esa oración se traduce sin protegerlos."""
+        oraciones = _oraciones(texto) or [texto]
+        marcadas = [_proteger_terminos(o, self.terminos) for o in oraciones]
+        traducidas = self._traducir_lote([m for m, _ in marcadas])
+        resultado = []
+        for original, (_, usados), traducida in zip(oraciones, marcadas, traducidas):
+            restaurada = _restaurar_terminos(traducida, usados) if usados else traducida
+            resultado.append(restaurada if restaurada is not None else self._traducir_lote([original])[0])
+        return " ".join(resultado)
 
     def pedir(self, clave, texto):
         self.pendientes.put((clave, texto))

@@ -120,7 +120,9 @@ hablarse la frase. Con la traducción activa, cada frase lleva debajo su versió
 
 | Parámetro | Valor | Para qué |
 |---|---|---|
-| `VOCABULARIO` | `("Claude", "CriptoBuzz", ...)` | Nombres y jerga que Whisper no conoce. Mantenerla corta (5 a 10). `()` la desactiva |
+| `VOCABULARIO` | `("Claude", "CriptoBuzz", ...)` | Nombres y jerga propios: no se traducen |
+| `CORRECCIONES` | `{"crypto ?bu[sz]+": "CriptoBuzz", ...}` | Arregla la escritura de nombres que Whisper no conoce ("CryptoBus" → "CriptoBuzz"), sin riesgo de inventar texto |
+| `USAR_PROMPT_VOCABULARIO` | `False` | Darle el vocabulario a Whisper como contexto. Desactivado: con música o ruido lo repetía como texto inventado y no mejoró la precisión |
 | `IDIOMA` / `IDIOMAS` | `"es"` / es, en | Idioma al abrir y opciones del selector |
 | `CARPETA_SALIDA` | `Documents\Transcripciones` | Dónde van los `.txt` |
 | `LIBERAR_VRAM_TRAS` | `300` | Segundos detenido tras los que se libera la VRAM (~900 MB); al iniciar se recarga en ~5 s sin perder audio. `None` = nunca |
