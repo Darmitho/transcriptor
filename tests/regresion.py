@@ -145,17 +145,72 @@ def prueba_ventana():
     return fallos
 
 
+def prueba_timer_vram():
+    """La ventana pide liberar la VRAM tras LIBERAR_VRAM_TRAS detenido, y no si se inicia antes."""
+    import tempfile
+    import tkinter as tk
+    cargar, carpeta, espera = T.Motor.cargar_modelo, T.CARPETA_SALIDA, T.LIBERAR_VRAM_TRAS
+    T.Motor.cargar_modelo, T.CARPETA_SALIDA = (lambda self: None), tempfile.mkdtemp(prefix="regresion_")
+    T.LIBERAR_VRAM_TRAS = 0.2
+    try:
+        root = tk.Tk()
+        app = T.App(root)
+        llamadas = []
+        app.motor.liberar_vram = lambda: llamadas.append(time.time()) or True
+        app.cola_ui.put(("modelo_listo", None))
+        app._procesar_cola()
+
+        def esperar(segundos):
+            fin = time.time() + segundos
+            while time.time() < fin:
+                root.update()
+                time.sleep(0.02)
+
+        esperar(0.5)
+        tras_espera = len(llamadas)
+        app._programar_liberar_vram()   # Vuelve a quedar detenido...
+        app._cancelar_timer_vram()      # ...pero se inicia antes de que venza
+        esperar(0.5)
+        tras_cancelar = len(llamadas)
+        root.destroy()
+    finally:
+        T.Motor.cargar_modelo, T.CARPETA_SALIDA, T.LIBERAR_VRAM_TRAS = cargar, carpeta, espera
+    return [] if (tras_espera, tras_cancelar) == (1, 1) else [("timer VRAM", tras_espera, tras_cancelar)]
+
+
+def prueba_recarga(motor, velocidad):
+    """Liberar la VRAM baja el uso de la GPU, y al volver a escuchar el modelo se recarga
+    sin perder la frase que empezó durante la recarga."""
+    import pynvml
+    pynvml.nvmlInit()
+    gpu = pynvml.nvmlDeviceGetHandleByIndex(0)
+    usada = lambda: pynvml.nvmlDeviceGetMemoryInfo(gpu).used / 2**20
+    antes = usada()
+    if not motor.liberar_vram():
+        return [("liberar_vram no liberó", motor.vram_liberada)], 0.0
+    liberada = antes - usada()
+    pistas = {"Otros": (np.concatenate([silencio(0.3), wav("frase"), silencio(2)]), REF_FRASE)}
+    textos, _ = correr_escenario(motor, pistas, velocidad)
+    err, _ = errores_palabras(REF_FRASE, textos["Otros"])
+    fallos = []
+    if liberada < 500:
+        fallos.append(("VRAM liberada (MB)", round(liberada)))
+    if err or motor.vram_liberada:
+        fallos.append(("tras recargar", textos["Otros"], motor.vram_liberada))
+    return fallos, liberada
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--velocidad", type=float, default=1.0, help="1.0 = tiempo real (lo representativo)")
     args = ap.parse_args()
 
-    fallos_unit = prueba_ventana()
+    fallos_unit = prueba_ventana() + prueba_timer_vram()
     motor = T.Motor(queue.Queue())
     motor.cargar_modelo()
     n_unit, f_unit = pruebas_unitarias(motor)
     fallos_unit += f_unit
-    n_unit += 1                         # + la prueba de la ventana
+    n_unit += 2                         # + la ventana y el temporizador de la VRAM
     print(f"\nunitarias: {n_unit - len(fallos_unit)}/{n_unit} OK")
     for f in fallos_unit:
         print("  FALLO:", f)
@@ -181,6 +236,13 @@ def main():
             total_pal += pal
             fallos += not ok
             print(f"{nombre:28s} {fuente:6s} {err:8d} {pal:9d} {hora:>16s}  {'OK' if ok else 'FALLO'}", flush=True)
+
+    f_recarga, liberada = prueba_recarga(motor, args.velocidad)
+    fallos += len(f_recarga)
+    print(f"{'liberar VRAM y recargar':28s} {'Otros':6s} {'':>8s} {'':>9s} {f'-{liberada:.0f} MB':>16s}  "
+          f"{'OK' if not f_recarga else 'FALLO'}")
+    for f in f_recarga:
+        print("  FALLO:", f)
 
     print(f"\nTOTAL errores de palabra: {total_err} de {total_pal} "
           f"({100 * total_err / total_pal:.1f} %) | escenarios con fallo: {fallos} | unitarias con fallo: {len(fallos_unit)}")

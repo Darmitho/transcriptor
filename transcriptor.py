@@ -81,6 +81,9 @@ CARPETA_SALIDA = os.path.expandvars(r"%USERPROFILE%\Documents\Transcripciones")
 # True = nunca conectarse a Hugging Face (el modelo debe estar ya descargado).
 # Poner False solo una vez si hace falta descargar un modelo nuevo.
 MODO_OFFLINE = True
+# Tras estos segundos detenido se libera la VRAM del modelo (~900 MB) y se recarga al
+# iniciar (~5 s, sin perder audio: espera en la cola). None = mantenerlo siempre en la GPU.
+LIBERAR_VRAM_TRAS = 300
 # =============================================================
 
 if MODO_OFFLINE:
@@ -296,6 +299,7 @@ class Motor:
         self.pa = None
         self.fuentes = []
         self.hilo = None
+        self.vram_liberada = False          # Modelo fuera de la GPU: se recarga al iniciar
         self.cambiar_idioma(IDIOMA)
 
     def cambiar_idioma(self, idioma):
@@ -345,6 +349,26 @@ class Motor:
 
     def hilo_activo(self):
         return self.hilo is not None and self.hilo.is_alive()
+
+    def liberar_vram(self):
+        """Saca el modelo de la GPU si la captura está detenida. Devuelve si lo hizo.
+        Solo aplica en GPU: el modelo de respaldo en CPU no ocupa VRAM."""
+        if self.modelo is None or self.vram_liberada or self.hilo_activo() or self.modelo.model.device != "cuda":
+            return False
+        self.modelo.model.unload_model(to_cpu=False)
+        self.vram_liberada = True
+        log.info("modelo descargado de la GPU (captura detenida)")
+        return True
+
+    def _recargar_si_hace_falta(self):
+        """En el hilo del Motor al empezar: el audio que llega mientras tanto espera en la cola."""
+        if self.vram_liberada:
+            self.cola_ui.put(("estado", "Recargando el modelo en la GPU..."))
+            t0 = time.perf_counter()
+            self.modelo.model.load_model()
+            self.vram_liberada = False
+            log.info("modelo recargado en la GPU en %.1f s", time.perf_counter() - t0)
+            self.cola_ui.put(("estado", "Escuchando"))
 
     def activar_mic(self, activo):
         """Abre o cierra el micrófono con la captura en marcha (se llama desde la UI)."""
@@ -554,6 +578,11 @@ class Motor:
         fuente.ultimo_parcial = time.time()
 
     def _bucle(self, stop, cola_audio, fuentes):
+        try:
+            self._recargar_si_hace_falta()
+        except Exception as e:
+            log.error("Error al recargar el modelo: %s", e)
+            stop.set()                      # Sin modelo no hay nada que hacer: avisa "detenido"
         while not stop.is_set():
             # Recoger todo el audio disponible, repartido a su fuente
             vaciada = False
@@ -678,6 +707,7 @@ class App:
         self.texto.configure(state="disabled")
 
         root.protocol("WM_DELETE_WINDOW", self.cerrar)
+        self.timer_vram = None              # Liberar la VRAM tras LIBERAR_VRAM_TRAS detenido
         threading.Thread(target=self.motor.cargar_modelo, daemon=True).start()
         root.after(100, self.revisar_cola)
 
@@ -690,14 +720,31 @@ class App:
             self.activo = False
             self.motor.detener()
         else:
+            self._cancelar_timer_vram()
             try:
                 self.motor.iniciar(con_mic=self.mic.get())
             except Exception as e:
                 messagebox.showerror("Error de audio", str(e))
+                self._programar_liberar_vram()
                 return
             self.btn.configure(text="■ Detener")
             self.btn_reconectar.configure(state="normal")
             self.activo = True
+
+    def _programar_liberar_vram(self):
+        self._cancelar_timer_vram()
+        if LIBERAR_VRAM_TRAS is not None:
+            self.timer_vram = self.root.after(int(LIBERAR_VRAM_TRAS * 1000), self._liberar_vram)
+
+    def _cancelar_timer_vram(self):
+        if self.timer_vram is not None:
+            self.root.after_cancel(self.timer_vram)
+            self.timer_vram = None
+
+    def _liberar_vram(self):
+        self.timer_vram = None
+        if not self.activo and self.motor.liberar_vram():
+            self.estado.configure(text="Modelo fuera de la GPU: se recarga al iniciar (~5 s)")
 
     def reconectar(self):
         if not self.activo:
@@ -776,6 +823,7 @@ class App:
                     self.estado.configure(text=valor)
                 elif tipo == "modelo_listo":
                     self.btn.configure(state="normal")
+                    self._programar_liberar_vram()
                 elif tipo == "parcial":
                     self._poner_parcial(valor)
                 elif tipo == "final":
@@ -788,8 +836,15 @@ class App:
                     if self.cerrando:
                         self._destruir()
                     else:
-                        self.estado.configure(text="Detenido")
+                        error = self.activo     # El hilo terminó solo: no pudo recargar el modelo
+                        if error:
+                            self.activo = False
+                            self.motor.detener()
+                            self.btn_reconectar.configure(state="disabled")
+                        self.estado.configure(text="Error al recargar el modelo (ver consola)" if error
+                                              else "Detenido")
                         self.btn.configure(text="▶ Iniciar", state="normal")
+                        self._programar_liberar_vram()
         except queue.Empty:
             pass
 
