@@ -184,6 +184,7 @@ def main():
     ap.add_argument("--etiqueta", default="medicion")
     ap.add_argument("--escenarios", default="detenido,silencio,una_fuente,dos_fuentes",
                     help="Lista separada por comas: para repetir solo los que interesan")
+    ap.add_argument("--subtitulos", action="store_true", help="Medir con la franja de subtítulos visible")
     args = ap.parse_args()
 
     pynvml.nvmlInit()
@@ -238,6 +239,8 @@ def main():
         else:
             root.after(200, revisar_fin)
 
+    if args.subtitulos:
+        root.after(500, lambda: app.alternar_subtitulos(True))
     threading.Thread(target=guion, daemon=True).start()
     root.after(200, revisar_fin)
     root.mainloop()

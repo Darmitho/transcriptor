@@ -666,8 +666,13 @@ class Configuracion(dict):
     Un archivo dañado o con valores de otro tipo no impide abrir: se usan los valores iniciales."""
 
     INICIAL = {"idioma": IDIOMA, "siempre_encima": True, "geometria": "760x440",
-               "tamano_letra": 14, "color_yo": "#7fd18b", "color_otros": "#e8e8e8"}
+               "tamano_letra": 14, "color_yo": "#7fd18b", "color_otros": "#e8e8e8",
+               # Franja de subtítulos
+               "franja_tamano": 22, "franja_lineas": 2, "franja_opacidad": 0.9, "franja_posicion": "abajo",
+               # Atajo de todo el sistema para entrar y salir de los subtítulos ("" = sin atajo global)
+               "atajo_subtitulos": "Ctrl+Shift+S"}
     LETRA_MIN, LETRA_MAX = 9, 36
+    FRANJA_LINEAS_MAX = 4
 
     def __init__(self, ruta=None):
         super().__init__(self.INICIAL)
@@ -714,6 +719,84 @@ def _geometria_visible(geometria):
     return geometria if dentro else f"{m.group(1)}x{m.group(2)}"
 
 
+def _parsear_atajo(texto):
+    """'Ctrl+Shift+S' -> (modificadores, tecla virtual) para RegisterHotKey, o None si no se entiende."""
+    MODIFICADORES = {"ctrl": 0x2, "control": 0x2, "alt": 0x1, "shift": 0x4, "mayus": 0x4, "win": 0x8}
+    partes = [p.strip().lower() for p in texto.split("+") if p.strip()]
+    if len(partes) < 2 or any(p not in MODIFICADORES for p in partes[:-1]):
+        return None
+    mods = 0
+    for p in partes[:-1]:
+        mods |= MODIFICADORES[p]
+    tecla = partes[-1]
+    if len(tecla) == 1 and tecla.isalnum() and tecla.isascii():
+        return mods, ord(tecla.upper())
+    if re.fullmatch(r"f([1-9]|1\d|2[0-4])", tecla):
+        return mods, 0x70 + int(tecla[1:]) - 1
+    return None
+
+
+class AtajoGlobal(threading.Thread):
+    """Atajo de todo el sistema: funciona aunque la ventana no tenga el foco (p. ej. desde Teams).
+    Windows entrega WM_HOTKEY a la cola de mensajes del hilo que registró el atajo, por eso
+    vive en su propio hilo y avisa a la ventana por cola_ui con ("atajo", nombre)."""
+
+    WM_HOTKEY, WM_QUIT, MOD_NOREPEAT = 0x0312, 0x0012, 0x4000
+
+    def __init__(self, combinacion, nombre, cola_ui):
+        super().__init__(daemon=True)
+        self.combinacion, self.nombre, self.cola_ui = combinacion, nombre, cola_ui
+        self.id_hilo = None
+        self.registrado = threading.Event()  # Se marca también si falló, para no quedar esperando
+        self.ok = False
+
+    def run(self):
+        import ctypes
+        from ctypes import wintypes
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        self.id_hilo = kernel32.GetCurrentThreadId()
+        tecla = _parsear_atajo(self.combinacion)
+        self.ok = bool(tecla) and bool(user32.RegisterHotKey(None, 1, tecla[0] | self.MOD_NOREPEAT, tecla[1]))
+        self.registrado.set()
+        if not self.ok:
+            log.warning("No se pudo registrar el atajo global %s (¿lo usa otra app?)", self.combinacion)
+            return
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == self.WM_HOTKEY:
+                self.cola_ui.put(("atajo", self.nombre))
+        user32.UnregisterHotKey(None, 1)
+
+    def detener(self):
+        if self.id_hilo is not None:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(self.id_hilo, self.WM_QUIT, 0, 0)
+
+
+def _area_trabajo():
+    """(x0, y0, x1, y1) de la pantalla principal sin la barra de tareas."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        r = wintypes.RECT()
+        ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(r), 0)   # SPI_GETWORKAREA
+        return r.left, r.top, r.right, r.bottom
+    except (AttributeError, OSError):
+        return None
+
+
+def _no_capturar_clics(hwnd):
+    """Estilos de Windows para la franja: los clics pasan a lo que está debajo, no aparece
+    en la barra de tareas ni en Alt+Tab y no roba el foco. Devuelve si quedaron aplicados."""
+    import ctypes
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW, WS_EX_NOACTIVATE = 0x80000, 0x20, 0x80, 0x8000000
+    u = ctypes.windll.user32
+    estilos = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+    u.SetWindowLongW(hwnd, GWL_EXSTYLE, u.GetWindowLongW(hwnd, GWL_EXSTYLE) | estilos)
+    return u.GetWindowLongW(hwnd, GWL_EXSTYLE) & estilos == estilos
+
+
 class App:
     FONDO, TEXTO, GRIS, ACENTO = "#1e1f22", "#e8e8e8", "#8a8d93", "#6ea8fe"
     VERDE, AMARILLO, ROJO = "#5cc98a", "#e5c07b", "#e06c75"
@@ -726,6 +809,11 @@ class App:
         self.config = Configuracion()
         if self.config["idioma"] not in IDIOMAS.values():
             self.config["idioma"] = IDIOMA
+        if self.config["franja_posicion"] not in ("abajo", "arriba"):
+            self.config["franja_posicion"] = "abajo"
+        self.config["franja_lineas"] = max(1, min(Configuracion.FRANJA_LINEAS_MAX, self.config["franja_lineas"]))
+        self.config["franja_opacidad"] = max(0.3, min(1.0, self.config["franja_opacidad"]))
+        self.config["franja_tamano"] = max(12, min(48, self.config["franja_tamano"]))
         self.cola_ui = queue.Queue()
         self.motor = Motor(self.cola_ui)
         self.motor.cambiar_idioma(self.config["idioma"])
@@ -770,7 +858,11 @@ class App:
         menu.configure(highlightthickness=0, **estilo)
         menu["menu"].configure(bg="#2b2d31", fg=self.TEXTO, activebackground="#3a3d43")
         menu.pack(side="left", padx=4)
-        tk.Button(barra, text="⚙", command=self.abrir_ajustes, **estilo).pack(side="left")
+        self.subtitulos = tk.BooleanVar(value=False)
+        tk.Checkbutton(barra, text="CC Subtítulos", variable=self.subtitulos,
+                       command=lambda: self.alternar_subtitulos(self.subtitulos.get()),
+                       indicatoron=False, selectcolor="#2f4f7f", offrelief="flat", **estilo).pack(side="left")
+        tk.Button(barra, text="⚙", command=self.abrir_ajustes, **estilo).pack(side="left", padx=4)
         self.estado = tk.Label(barra, text="", bg=self.FONDO, fg=self.GRIS, anchor="e")
         self.estado.pack(side="right", fill="x", expand=True)
 
@@ -819,7 +911,14 @@ class App:
         self.texto.mark_gravity("parcial_ini", "left")
         self.texto.configure(state="disabled")
         self.ajustes = None                 # Ventana de ajustes, si está abierta
+        self.franja = None                  # Franja de subtítulos, si está visible
         self._enlazar_atajos()
+        self.atajo_global = None
+        if self.config["atajo_subtitulos"]:
+            self.atajo_global = AtajoGlobal(self.config["atajo_subtitulos"], "subtitulos", self.cola_ui)
+            self.atajo_global.start()
+            # Soltar el atajo al destruirse la ventana, se cierre como se cierre
+            root.bind("<Destroy>", lambda e: e.widget is root and self.atajo_global.detener(), add="+")
 
         root.protocol("WM_DELETE_WINDOW", self.cerrar)
         self.timer_vram = None              # Liberar la VRAM tras LIBERAR_VRAM_TRAS detenido
@@ -898,11 +997,13 @@ class App:
         "microfono": ("<Control-m>", "<Control-M>"),
         "letra_mas": ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"),
         "letra_menos": ("<Control-minus>", "<Control-KP_Subtract>"),
+        "subtitulos": ("<Control-S>",),     # Respaldo local; el global (Ctrl+Shift+S) lo atrapa antes
     }
 
     def _enlazar_atajos(self):
         acciones = {"iniciar_detener": self.atajo_iniciar_detener, "microfono": self.atajo_microfono,
-                    "letra_mas": lambda: self.cambiar_letra(+1), "letra_menos": lambda: self.cambiar_letra(-1)}
+                    "letra_mas": lambda: self.cambiar_letra(+1), "letra_menos": lambda: self.cambiar_letra(-1),
+                    "subtitulos": self.alternar_subtitulos}
         for nombre, secuencias in self.ATAJOS.items():
             for secuencia in secuencias:
                 # "break": que el atajo no llegue además al widget enfocado
@@ -916,6 +1017,75 @@ class App:
     def atajo_microfono(self):
         self.mic.set(not self.mic.get())
         self._alternar_mic()
+
+    # ---------- Modo subtítulos ----------
+    def alternar_subtitulos(self, activar=None):
+        """Alterna entre la vista normal y la franja de subtítulos (la ventana se minimiza)."""
+        activar = (self.franja is None) if activar is None else activar
+        self.subtitulos.set(activar)
+        if activar and self.franja is None:
+            self._crear_franja()
+            self.root.iconify()
+        elif not activar and self.franja is not None:
+            self.franja.destroy()
+            self.franja = None
+            self.root.deiconify()
+            self.root.lift()
+
+    def _crear_franja(self):
+        f = self.franja = tk.Toplevel(self.root, bg="#000000")
+        f.overrideredirect(True)            # Sin bordes ni barra de título
+        f.attributes("-topmost", True)
+        f.attributes("-alpha", self.config["franja_opacidad"])
+        self.letra_franja = tkfont.Font(family="Segoe UI", size=self.config["franja_tamano"])
+        self.texto_franja = tk.Text(f, bg="#000000", fg=self.TEXTO, font=self.letra_franja, wrap="word",
+                                    relief="flat", borderwidth=0, highlightthickness=0, padx=16, pady=8)
+        self.texto_franja.pack(fill="both", expand=True)
+        self.texto_franja.tag_config("parcial", foreground=self.GRIS)
+        for fuente, clave in ((NOMBRE_YO, "color_yo"), (NOMBRE_OTROS, "color_otros")):
+            self.texto_franja.tag_config(f"hablante_{fuente}", foreground=self.config[clave])
+        self._ubicar_franja()
+        f.update_idletasks()
+        try:
+            self.franja_sin_clics = _no_capturar_clics(int(f.wm_frame(), 16))
+        except (AttributeError, OSError, ValueError):
+            self.franja_sin_clics = False
+        self._actualizar_franja()
+
+    def _ubicar_franja(self):
+        """80 % del ancho de la pantalla principal, centrada, sobre la barra de tareas o arriba."""
+        area = _area_trabajo() or (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())
+        x0, y0, x1, y1 = area
+        ancho = int((x1 - x0) * 0.8)
+        alto = self.config["franja_lineas"] * self.letra_franja.metrics("linespace") + 16
+        x = x0 + (x1 - x0 - ancho) // 2
+        y = y1 - alto - 24 if self.config["franja_posicion"] == "abajo" else y0 + 24
+        self.franja.geometry(f"{ancho}x{alto}+{x}+{y}")
+        self.texto_franja.configure(height=self.config["franja_lineas"])
+
+    def _actualizar_franja(self):
+        """Las últimas frases (finales y provisionales) que caben en la franja."""
+        if self.franja is None:
+            return
+        lineas = [(f"{fuente}: {t}", f"hablante_{fuente}") for _, _, fuente, t in self.finales]
+        lineas += [(f"{fuente}: {t}", "parcial") for fuente, t in self.parciales.items() if t]
+        t = self.texto_franja
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        for i, (texto, etiqueta) in enumerate(lineas[-self.config["franja_lineas"]:]):
+            t.insert("end", ("\n" if i else "") + texto, etiqueta)
+        t.configure(state="disabled")
+        t.see("end")                        # Si una frase larga ocupa varias líneas, se ve su final
+
+    def _cambiar_franja(self, clave, valor):
+        """Desde Ajustes: guarda y, si la franja está visible, la actualiza al instante."""
+        self.config[clave] = valor
+        self.config.guardar()
+        if self.franja is not None:
+            self.franja.attributes("-alpha", self.config["franja_opacidad"])
+            self.letra_franja.configure(size=self.config["franja_tamano"])
+            self._ubicar_franja()
+            self._actualizar_franja()
 
     # ---------- Letra y colores ----------
     def cambiar_letra(self, delta=0, tamano=None):
@@ -936,6 +1106,8 @@ class App:
                 self.config[clave] = Configuracion.INICIAL[clave]
             self.texto.tag_config(f"hablante_{fuente}", foreground=self.config[clave])
             self.medidores.itemconfigure(self.barras[fuente][0], fill=self.config[clave])
+            if getattr(self, "franja", None) is not None:
+                self.texto_franja.tag_config(f"hablante_{fuente}", foreground=self.config[clave])
 
     def elegir_color(self, clave, boton=None):
         _, color = colorchooser.askcolor(self.config[clave], parent=self.ajustes or self.root,
@@ -966,6 +1138,35 @@ class App:
             b = tk.Button(v, width=4, relief="flat", bg=self.config[clave], activebackground=self.config[clave])
             b.configure(command=lambda c=clave, b=b: self.elegir_color(c, b))
             b.grid(row=fila, column=1, sticky="w")
+        # Franja de subtítulos
+        tk.Label(v, text="Subtítulos", bg=self.FONDO, fg=self.ACENTO).grid(row=3, column=0, sticky="w", pady=(12, 2))
+        franja_tamano = tk.IntVar(value=self.config["franja_tamano"])
+        franja_lineas = tk.IntVar(value=self.config["franja_lineas"])
+        tk.Label(v, text="Tamaño de letra", **etiqueta).grid(row=4, column=0, sticky="w", pady=4)
+        tk.Spinbox(v, from_=12, to=48, width=5, textvariable=franja_tamano,
+                   command=lambda: self._cambiar_franja("franja_tamano", franja_tamano.get())
+                   ).grid(row=4, column=1, sticky="w")
+        tk.Label(v, text="Líneas", **etiqueta).grid(row=5, column=0, sticky="w", pady=4)
+        tk.Spinbox(v, from_=1, to=Configuracion.FRANJA_LINEAS_MAX, width=5, textvariable=franja_lineas,
+                   command=lambda: self._cambiar_franja("franja_lineas", franja_lineas.get())
+                   ).grid(row=5, column=1, sticky="w")
+        tk.Label(v, text="Opacidad", **etiqueta).grid(row=6, column=0, sticky="w", pady=4)
+        escala = tk.Scale(v, from_=30, to=100, orient="horizontal", length=120, bg=self.FONDO, fg=self.TEXTO,
+                          highlightthickness=0, troughcolor="#2b2d31")
+        escala.set(round(self.config["franja_opacidad"] * 100))
+        # El comando va después de set(): si no, abrir Ajustes ya contaría como un cambio
+        escala.configure(command=lambda x: self._cambiar_franja("franja_opacidad", int(float(x)) / 100))
+        escala.grid(row=6, column=1, sticky="w")
+        tk.Label(v, text="Posición", **etiqueta).grid(row=7, column=0, sticky="w", pady=4)
+        posicion = tk.StringVar(value=self.config["franja_posicion"])
+        m = tk.OptionMenu(v, posicion, "abajo", "arriba", command=lambda p: self._cambiar_franja("franja_posicion", p))
+        m.configure(highlightthickness=0, **self.estilo)
+        m.grid(row=7, column=1, sticky="w")
+        atajo = self.config["atajo_subtitulos"] or "ninguno"
+        estado_atajo = "" if self.atajo_global is None or self.atajo_global.ok else " (no disponible)"
+        tk.Label(v, text=f"Atajo global: {atajo}{estado_atajo}\nSe cambia en {CONFIG_ARCHIVO}",
+                 bg=self.FONDO, fg=self.GRIS, justify="left", wraplength=300).grid(
+            row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
         tk.Button(v, text="Cerrar", command=v.destroy, **self.estilo).grid(row=9, column=0, columnspan=2, pady=(12, 0))
 
     def limpiar(self):
@@ -975,6 +1176,7 @@ class App:
         self.texto.delete("1.0", "end")
         self.texto.mark_set("parcial_ini", "1.0")
         self.texto.configure(state="disabled")
+        self._actualizar_franja()
 
     def guardar(self):
         ruta = filedialog.asksaveasfilename(defaultextension=".txt", initialdir=CARPETA_SALIDA,
@@ -1006,6 +1208,8 @@ class App:
     def _destruir(self):
         if not self.destruida:
             self.destruida = True
+            if self.atajo_global is not None:
+                self.atajo_global.detener()
             self.root.destroy()
 
     # ---------- Actualización de la ventana ----------
@@ -1064,6 +1268,8 @@ class App:
                     self._poner_parcial(valor)
                 elif tipo == "final":
                     self._agregar_final(valor)
+                elif tipo == "atajo" and valor == "subtitulos":
+                    self.alternar_subtitulos()
                 elif tipo == "error_mic":
                     self.mic.set(False)
                     messagebox.showerror("Error de micrófono",
@@ -1098,6 +1304,7 @@ class App:
         fuente, s = valor
         self.parciales[fuente] = s
         self._mostrar_parciales()
+        self._actualizar_franja()
 
     def _agregar_final(self, valor):
         fuente, s, inicio = valor
@@ -1119,6 +1326,7 @@ class App:
         self.texto.mark_set("parcial_ini", "end-1c")
         self.texto.configure(state="disabled")
         self._mostrar_parciales()           # Parciales de otras fuentes, debajo del final
+        self._actualizar_franja()
 
     def _guardar_registro(self):
         """Reescribe el .txt automático ya ordenado. Se escribe a un temporal y se

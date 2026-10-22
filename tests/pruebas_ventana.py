@@ -273,7 +273,96 @@ def atajos():
     return fallos
 
 
-PRUEBAS = [orden_cronologico, timer_vram, configuracion, letra_y_colores, medidores_y_estado, atajos]
+def subtitulos():
+    """La franja: no captura clics, queda visible con la ventana minimizada, muestra las últimas
+    líneas con sus colores, se ubica abajo o arriba dentro del área útil y vuelve a la vista normal."""
+    fallos = []
+    with app_aislada():
+        root = tk.Tk()
+        app = T.App(root)
+        base = time.time()
+        for i, (fuente, texto) in enumerate([("Otros", "Uno."), ("Yo", "Dos."), ("Otros", "Tres.")]):
+            app.cola_ui.put(("final", (fuente, texto, base + i)))
+        app.cola_ui.put(("parcial", ("Yo", "cuatro provisional")))
+        app._procesar_cola()
+
+        app.alternar_subtitulos()
+        _esperar(root, 0.4)
+        f = app.franja
+        if f is None or not app.franja_sin_clics or not f.winfo_viewable() or root.state() != "iconic":
+            fallos.append(("entrar", f is not None, getattr(app, "franja_sin_clics", None),
+                           f is not None and f.winfo_viewable(), root.state()))
+        lineas = app.texto_franja.get("1.0", "end-1c").splitlines()
+        if lineas != ["Otros: Tres.", "Yo: cuatro provisional"]:
+            fallos.append(("líneas", lineas))
+        if "hablante_Otros" not in app.texto_franja.tag_names("1.2") or "parcial" not in app.texto_franja.tag_names("2.2"):
+            fallos.append(("colores", app.texto_franja.tag_names("1.2"), app.texto_franja.tag_names("2.2")))
+
+        x0, y0, x1, y1 = T._area_trabajo()
+        abajo = (f.winfo_y(), f.winfo_height())
+        app._cambiar_franja("franja_posicion", "arriba")
+        app._cambiar_franja("franja_lineas", 3)
+        app._cambiar_franja("franja_opacidad", 0.6)
+        _esperar(root, 0.2)
+        arriba = (f.winfo_y(), f.winfo_height())
+        lineas3 = app.texto_franja.get("1.0", "end-1c").splitlines()
+        if not (abajo[0] + abajo[1] <= y1 and abajo[0] > (y0 + y1) / 2 and y0 <= arriba[0] < (y0 + y1) / 2
+                and arriba[1] > abajo[1] and len(lineas3) == 3 and abs(float(f.attributes("-alpha")) - 0.6) < 0.02):
+            fallos.append(("ubicación / líneas / opacidad", abajo, arriba, (y0, y1), lineas3, f.attributes("-alpha")))
+
+        app.alternar_subtitulos()
+        _esperar(root, 0.3)
+        if app.franja is not None or root.state() != "normal" or app.subtitulos.get():
+            fallos.append(("salir", app.franja, root.state(), app.subtitulos.get()))
+        root.destroy()
+    return fallos
+
+
+def atajo_global():
+    """De punta a punta: una pulsación real (simulada con la API de Windows) del atajo global
+    alterna la franja aunque el foco esté en otra ventana. Usa una combinación poco común."""
+    import ctypes
+    fallos = []
+    casos = {"Ctrl+Shift+S": (0x6, ord("S")), "ctrl + alt + f11": (0x3, 0x7A), "Win+F24": (0x8, 0x87),
+             "S": None, "Ctrl+Ñ": None, "Hiper+S": None, "Ctrl+F25": None}
+    for texto, esperado in casos.items():
+        if T._parsear_atajo(texto) != esperado:
+            fallos.append(("parsear", texto, T._parsear_atajo(texto), esperado))
+
+    with app_aislada(atajo_global="Ctrl+Alt+Shift+F11"):
+        root = tk.Tk()
+        app = T.App(root)
+        app.atajo_global.registrado.wait(2)
+        if not app.atajo_global.ok:
+            root.destroy()
+            return fallos + [("no se pudo registrar Ctrl+Alt+Shift+F11",)]
+        u = ctypes.windll.user32
+
+        def pulsar():
+            teclas = (0x11, 0x12, 0x10, 0x7A)      # Ctrl, Alt, Shift, F11
+            for vk in teclas:
+                u.keybd_event(vk, 0, 0, 0)
+            for vk in reversed(teclas):
+                u.keybd_event(vk, 0, 2, 0)         # KEYEVENTF_KEYUP
+            _esperar(root, 0.5)
+            app._procesar_cola()
+
+        pulsar()
+        entro = app.franja is not None
+        pulsar()
+        salio = app.franja is None
+        hilo = app.atajo_global
+        root.destroy()
+        hilo.join(2)
+        if not (entro and salio):
+            fallos.append(("atajo global", entro, salio))
+        if hilo.is_alive():
+            fallos.append(("el atajo no se soltó al cerrar",))
+    return fallos
+
+
+PRUEBAS = [orden_cronologico, timer_vram, configuracion, letra_y_colores, medidores_y_estado, atajos,
+           subtitulos, atajo_global]
 
 
 def todas():

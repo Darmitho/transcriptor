@@ -30,18 +30,22 @@ REF_FRASE = "Buenos días a todos. Hoy vamos a revisar el presupuesto del proyec
 
 
 @contextlib.contextmanager
-def app_aislada(sin_modelo=True):
+def app_aislada(sin_modelo=True, atajo_global=""):
     """Para crear la ventana (App) en pruebas o mediciones sin tocar las transcripciones
-    ni la configuración reales. Con sin_modelo no carga Whisper. Devuelve la carpeta temporal."""
+    ni la configuración reales. Con sin_modelo no carga Whisper. Sin atajo global salvo que
+    se pida uno: registrarlo ocupa esa combinación en todo el sistema. Devuelve la carpeta."""
     carpeta = tempfile.mkdtemp(prefix="prueba_")
-    antes = (T.CARPETA_SALIDA, T.CONFIG_ARCHIVO, T.Motor.cargar_modelo)
+    antes = (T.CARPETA_SALIDA, T.CONFIG_ARCHIVO, T.Motor.cargar_modelo,
+             T.Configuracion.INICIAL["atajo_subtitulos"])
     T.CARPETA_SALIDA, T.CONFIG_ARCHIVO = carpeta, os.path.join(carpeta, "config.json")
+    T.Configuracion.INICIAL["atajo_subtitulos"] = atajo_global
     if sin_modelo:
         T.Motor.cargar_modelo = lambda self: None
     try:
         yield carpeta
     finally:
-        T.CARPETA_SALIDA, T.CONFIG_ARCHIVO, T.Motor.cargar_modelo = antes
+        (T.CARPETA_SALIDA, T.CONFIG_ARCHIVO, T.Motor.cargar_modelo,
+         T.Configuracion.INICIAL["atajo_subtitulos"]) = antes
 
 
 def wav(nombre, recortar=False):
