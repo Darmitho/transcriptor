@@ -36,6 +36,7 @@ MAX_FRASE = 20.0                # Sin pausas hasta aquí: se corta antes de la �
 MAX_ARRASTRE = 3.0              # Audio máximo que pasa a la frase siguiente tras ese corte
 TROZO = 0.1                     # Duración de cada bloque de audio capturado (segundos)
 NOMBRE_OTROS = "Otros"          # Etiqueta del audio del PC (lo que dicen los demás)
+NOMBRE_YO = "Yo"                # Etiqueta del micrófono (lo que digo yo)
 
 # --- Detección de voz (Silero VAD, incluido en faster-whisper, corre en CPU) ---
 VAD_UMBRAL = 0.5                # Probabilidad para considerar que empieza la voz
@@ -176,6 +177,7 @@ class Fuente:
         self.previo = ""                    # Texto antes de un corte en palabra (para quitar solapes)
         self.ultimo_audio = self.ultimo_parcial = time.time()
         self.stats = Counter()
+        self.retirar = False                # El hilo del Motor la cierra y la quita de la lista
 
     # ---------- Captura ----------
     def abrir(self, pa):
@@ -296,10 +298,31 @@ class Motor:
                 return lb
         raise RuntimeError("No se encontró un dispositivo loopback para la salida predeterminada.")
 
+    def _dispositivo_mic(self):
+        wasapi = self.pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        if wasapi["defaultInputDevice"] < 0:
+            raise RuntimeError("No hay un micrófono predeterminado en Windows.")
+        return self.pa.get_device_info_by_index(wasapi["defaultInputDevice"])
+
     def hilo_activo(self):
         return self.hilo is not None and self.hilo.is_alive()
 
-    def iniciar(self):
+    def activar_mic(self, activo):
+        """Abre o cierra el micrófono con la captura en marcha (se llama desde la UI)."""
+        if self.pa is None:
+            return
+        mic = next((f for f in self.fuentes if f.nombre == NOMBRE_YO and not f.retirar), None)
+        if activo and mic is None:
+            mic = Fuente(NOMBRE_YO, self._dispositivo_mic(), self.cola_audio)
+            mic.abrir(self.pa)
+            self.fuentes.append(mic)
+            self.cola_ui.put(("estado", f"Micrófono activo: {mic.disp['name']}"))
+        elif not activo and mic is not None:
+            mic.cerrar_stream()
+            mic.retirar = True              # El hilo cierra su última frase y la quita
+            self.cola_ui.put(("estado", "Micrófono apagado"))
+
+    def iniciar(self, con_mic=False):
         if self.hilo_activo():
             raise RuntimeError("La captura anterior aún se está cerrando, intenta de nuevo.")
         # Cola y evento nuevos por sesión: nada de una sesión anterior se mezcla con esta
@@ -318,6 +341,11 @@ class Motor:
                                      daemon=True)
         self.hilo.start()
         self.cola_ui.put(("estado", f"Escuchando: {otros.disp['name']}"))
+        if con_mic:
+            try:
+                self.activar_mic(True)
+            except Exception as e:          # Sin micrófono se sigue con el audio del PC
+                self.cola_ui.put(("error_mic", str(e)))
 
     def detener(self):
         """Corta la captura. El hilo cierra las frases pendientes y avisa con 'detenido'."""
@@ -455,6 +483,7 @@ class Motor:
     def _bucle(self, stop, cola_audio, fuentes):
         while not stop.is_set():
             # Recoger todo el audio disponible, repartido a su fuente
+            vaciada = False
             try:
                 fuente, x = cola_audio.get(timeout=0.1)
                 while True:
@@ -463,9 +492,20 @@ class Motor:
                         break               # Cerrar antes de mezclar con la frase siguiente
                     fuente, x = cola_audio.get_nowait()
             except queue.Empty:
-                pass
+                vaciada = True
 
             try:
+                # Fuentes apagadas (micrófono): con la cola vacía ya no queda audio suyo
+                retiradas = [f for f in fuentes if f.retirar] if vaciada else []
+                for f in retiradas:
+                    try:
+                        if f.trozos:
+                            self._cerrar_frase(f, "detener")
+                    finally:
+                        fuentes.remove(f)
+                        f.resumen()
+                        self.cola_ui.put(("parcial", (f.nombre, "")))
+
                 # Primero los finales (lo que se guarda), luego un parcial a la vez:
                 # el de la fuente que lleva más tiempo sin refrescarse
                 pendientes = [(f, f.motivo_cierre()) for f in fuentes]
@@ -532,6 +572,10 @@ class App:
         self.btn.pack(side="left")
         tk.Button(barra, text="Limpiar", command=self.limpiar, **estilo).pack(side="left", padx=4)
         tk.Button(barra, text="Guardar...", command=self.guardar, **estilo).pack(side="left")
+        self.mic = tk.BooleanVar(value=False)   # Apagado al iniciar: evita transcribirme por accidente
+        tk.Checkbutton(barra, text="🎤 Micrófono", variable=self.mic, command=self._alternar_mic,
+                       indicatoron=False, selectcolor="#2f6f3e", offrelief="flat",
+                       **estilo).pack(side="left", padx=4)
         self.encima = tk.BooleanVar(value=True)
         tk.Checkbutton(barra, text="Siempre encima", variable=self.encima, command=self._encima,
                        bg=self.FONDO, fg=self.TEXTO, selectcolor="#2b2d31",
@@ -561,12 +605,22 @@ class App:
             self.motor.detener()
         else:
             try:
-                self.motor.iniciar()
+                self.motor.iniciar(con_mic=self.mic.get())
             except Exception as e:
                 messagebox.showerror("Error de audio", str(e))
                 return
             self.btn.configure(text="■ Detener")
             self.activo = True
+
+    def _alternar_mic(self):
+        """Con la captura detenida solo se recuerda la elección; en marcha se aplica al tiro."""
+        if not self.activo:
+            return
+        try:
+            self.motor.activar_mic(self.mic.get())
+        except Exception as e:
+            self.mic.set(False)
+            messagebox.showerror("Error de micrófono", str(e))
 
     def _encima(self):
         self.root.attributes("-topmost", self.encima.get())
@@ -584,7 +638,7 @@ class App:
                                             filetypes=[("Texto", "*.txt")])
         if ruta:
             with open(ruta, "w", encoding="utf-8") as f:
-                f.write("\n".join(f"[{h}] {t}" for h, t in self.finales))
+                f.write("\n".join(f"[{h}] {fuente}: {t}" for h, fuente, t in self.finales))
 
     def cerrar(self):
         if self.cerrando:
@@ -625,6 +679,10 @@ class App:
                     self._poner_parcial(valor)
                 elif tipo == "final":
                     self._agregar_final(valor)
+                elif tipo == "error_mic":
+                    self.mic.set(False)
+                    messagebox.showerror("Error de micrófono",
+                                         f"{valor}\n\nSe sigue transcribiendo solo el audio del PC.")
                 elif tipo == "detenido":
                     if self.cerrando:
                         self._destruir()
@@ -637,7 +695,7 @@ class App:
     def _mostrar_parciales(self):
         self.texto.configure(state="normal")
         self.texto.delete("parcial_ini", "end-1c")   # "end" borraría también el último salto de línea
-        s = "\n".join(t for t in self.parciales.values() if t)
+        s = "\n".join(f"{fuente}: {t}" for fuente, t in self.parciales.items() if t)
         if s:
             self.texto.insert("end", s, "parcial")
         self.texto.configure(state="disabled")
@@ -652,13 +710,13 @@ class App:
         fuente, s = valor
         self.parciales[fuente] = ""
         hora = datetime.datetime.now().strftime("%H:%M:%S")
-        self.finales.append((hora, s))
+        self.finales.append((hora, fuente, s))
         with open(self.archivo_auto, "a", encoding="utf-8") as f:
-            f.write(f"[{hora}] {s}\n")
+            f.write(f"[{hora}] {fuente}: {s}\n")
         self.texto.configure(state="normal")
         self.texto.delete("parcial_ini", "end-1c")   # "end" borraría también el último salto de línea
         self.texto.insert("end", f"{hora}  ", "hora")
-        self.texto.insert("end", s + "\n")
+        self.texto.insert("end", f"{fuente}: {s}\n")
         self.texto.mark_set("parcial_ini", "end-1c")
         self.texto.configure(state="disabled")
         self._mostrar_parciales()           # Parciales de otras fuentes, debajo del final
