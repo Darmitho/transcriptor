@@ -30,7 +30,8 @@ IDIOMA = "es"                   # Idioma al abrir el programa
 SR_MODELO = 16000
 
 INTERVALO_PARCIAL = 1.0         # Cada cuántos segundos se refresca el texto provisional
-SILENCIO_FIN = 0.7              # Segundos sin voz (según el VAD) que cierran una frase
+SILENCIO_FIN = 1.0              # Segundos sin voz (según el VAD) que cierran una frase.
+                                # Con 0.7 las pausas a mitad de idea partían frases en fragmentos
 FRASE_LARGA = 10.0              # Desde aquí, una pausa corta (PAUSA_CORTE) ya cierra la frase
 PAUSA_CORTE = 0.2               # Micro-pausa (respiración) suficiente para cortar una frase larga
 MAX_FRASE = 20.0                # Sin pausas hasta aquí: se corta antes de la última palabra
