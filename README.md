@@ -11,6 +11,7 @@ en la GPU: el audio y el texto nunca salen del equipo.
 - Detección de voz con Silero VAD y filtros contra las alucinaciones típicas de Whisper en silencio.
 - Español e inglés, vocabulario propio (nombres, jerga) y configuración que se recuerda entre sesiones.
 - Traducción en vivo del inglés al español (opcional, en CPU), con tu vocabulario sin traducir.
+- Escuchar solo una app (p. ej. Discord) o todo menos una (p. ej. Chrome con YouTube).
 
 ## Requisitos
 
@@ -73,6 +74,7 @@ Conviene ejecutarlo desde una terminal: ahí aparecen las métricas de cada tran
 | ▶ Iniciar / ■ Detener | Empieza o detiene la captura; al detener se transcribe la frase en curso |
 | 🎤 Micrófono | Agrega o quita tu micrófono, también con la captura en marcha. Siempre arranca apagado |
 | 🔄 Reconectar | Toma los dispositivos predeterminados actuales de Windows (tras conectar audífonos) |
+| 🔊 Todo ▾ | Qué audio del PC escuchar: **todo el sistema**, **solo** una app o **todo menos** una app, elegida de las que están sonando. Se aplica al instante y se recuerda ([detalles](#escuchar-una-sola-app)) |
 | Español / English | Idioma que se habla en el audio; aplica desde la frase siguiente |
 | Sin traducir / Original + traducción / Solo traducción | Traduce al español las frases finales cuando el idioma es English. La traducción aparece ~0.3 s después del texto, en cursiva debajo del original o en su lugar; la franja de subtítulos sigue la misma vista |
 | CC Subtítulos | Alterna entre la ventana y la franja de subtítulos |
@@ -82,6 +84,23 @@ Conviene ejecutarlo desde una terminal: ahí aparecen las métricas de cada tran
 | A− / A+ | Tamaño de la letra (9 a 36 pt) |
 | Limpiar / Guardar... | Vacía la ventana (el `.txt` automático no se toca) / guarda lo que está en la ventana |
 | Siempre encima | Mantiene la ventana sobre las demás |
+
+### Escuchar una sola app
+
+El menú **🔊** lista las apps que tienen audio en ese momento (Discord, Chrome, Zoom, Teams...):
+
+- **Solo Discord:** transcribe la llamada aunque tengas YouTube sonando en Chrome.
+- **Todo menos Chrome:** todo el sistema salvo el navegador.
+
+Detalles:
+
+- Se captura la **app completa**: "Solo Chrome" incluye todas sus pestañas (no se puede separar una
+  pestaña de Meet de otra de YouTube). Discord, Teams y Zoom de escritorio no tienen ese problema.
+- Si la app se cierra y se vuelve a abrir, pulsa **🔄 Reconectar** (se busca de nuevo por su nombre).
+- Si eliges "Solo X" y X no está abierta, avisa y sigue como estaba; "Todo menos X" con X cerrada
+  escucha todo el sistema.
+- Necesita Windows 10 compilación 20348 o posterior (Windows 11 lo cumple). Solo afecta a
+  **Otros**: el micrófono sigue igual.
 
 ### Atajos de teclado
 
@@ -160,6 +179,7 @@ Si otro programa usa la GPU al mismo tiempo, la latencia puede duplicarse.
 | No aparece la traducción | El selector de idioma debe estar en **English**: solo se traduce el audio en inglés |
 | "GPU no disponible, usando CPU" | Falla CUDA (driver viejo o GPU no NVIDIA). El respaldo en CPU usa el modelo `small`, que también hay que descargar una vez con `MODO_OFFLINE = False` |
 | Estado en amarillo ("Atrasado") seguido | La GPU no da abasto: cierra otros programas que la usen o prueba `MODELO = "medium"` |
+| "X no está abierto" al elegir Solo X | La app se cerró o aún no arrancó: ábrela y elige de nuevo en 🔊, o pulsa 🔄 Reconectar |
 | Ctrl+Shift+S no hace nada fuera de la ventana | Otra app ocupa el atajo (Ajustes dice "no disponible"): cámbialo en `atajo_subtitulos` |
 | `Error in sitecustomize ... pandas` en la consola | Viene de una configuración global de Python del equipo, no de este programa; no afecta |
 

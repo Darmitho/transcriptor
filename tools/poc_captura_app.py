@@ -82,8 +82,68 @@ def main():
     print("VIABLE" if ok else "NO FUNCIONÓ COMO SE ESPERABA")
 
 
+def reproducir_wav(ruta, veces):
+    """Proceso hijo: un clip de voz (16 kHz) por la salida predeterminada, varias veces."""
+    import wave
+    import pyaudiowpatch as pyaudio
+    from scipy.signal import resample_poly
+    with wave.open(ruta) as w:
+        a = np.frombuffer(w.readframes(w.getnframes()), np.int16).astype(np.float32) / 32768
+    a = np.concatenate([resample_poly(a, 3, 1).astype(np.float32) * 0.5, np.zeros(48000, np.float32)] * veces)
+    pa = pyaudio.PyAudio()
+    s = pa.open(format=pyaudio.paFloat32, channels=1, rate=48000, output=True)
+    s.write(a.tobytes())
+    s.close()
+    pa.terminate()
+
+
+def transcribir_solo_una():
+    """De punta a punta con la app: A dice una frase en inglés y B otra en español a la vez;
+    el motor escuchando "solo A" debe transcribir solo la de A."""
+    import queue
+    import captura_app
+    sys.path.insert(0, os.path.join(RAIZ, "tests"))
+    from comun import T
+    audio = os.path.join(RAIZ, "tests", "audio")
+    ref_a = "Today we are reviewing the quarterly budget with the client and the delivery dates."
+    a = subprocess.Popen([sys.executable, __file__, "--wav", os.path.join(audio, "en1.wav")])
+    b = subprocess.Popen([sys.executable, __file__, "--wav", os.path.join(audio, "frase.wav")])
+    m = T.Motor(queue.Queue())
+    m.cargar_modelo()
+    m.cambiar_idioma("en")
+    captura_app.pid_de_app = lambda nombre: a.pid   # Los dos son python.exe: se elige A por su PID
+    m.iniciar(escuchar=("solo", "A.exe"))
+    trozos = []
+    fuente = m.fuentes[0]
+    original = fuente.cola.put
+    fuente.cola.put = lambda item: (trozos.append(item), original(item))[1]
+    a.wait()
+    b.wait()
+    time.sleep(2)
+    m.detener()
+    m.hilo.join(60)
+    finales = " ".join(v[1] for k, v in m.cola_ui.queue if k == "final")
+    tamanos = {len(x) for _, x, _ in trozos}
+    inicios = [t for _, _, t in trozos]
+    pasos = np.diff(inicios) if len(inicios) > 1 else np.array([0.1])
+    # A repite su frase y la captura puede empezar a mitad de una repetición: basta con que la
+    # frase completa aparezca al menos una vez
+    completa = T._normalizar(ref_a) in T._normalizar(finales)
+    espanol = [p for p in ("presupuesto", "proyecto", "entrega", "buenos") if p in finales.lower()]
+    print(f"fuente: {type(fuente).__name__} '{fuente.disp['name']}' | trozos: {len(trozos)} de {sorted(tamanos)} muestras, "
+          f"cada {np.median(pasos):.3f} s | nivel último {fuente.nivel:.3f}")
+    print(f"transcrito: {finales!r}")
+    print(f"frase de A completa: {'sí' if completa else 'no'} | palabras de B (español) que se colaron: {espanol or 'ninguna'}")
+    ok = tamanos == {4800} and abs(np.median(pasos) - 0.1) < 0.02 and completa and not espanol
+    print("\nINTEGRACIÓN OK" if ok else "\nINTEGRACIÓN CON PROBLEMAS")
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--tono":
         reproducir_tono(float(sys.argv[2]), DURACION_TONOS)
+    elif len(sys.argv) == 3 and sys.argv[1] == "--wav":
+        reproducir_wav(sys.argv[2], 3)
+    elif len(sys.argv) == 2 and sys.argv[1] == "--transcribir":
+        transcribir_solo_una()
     else:
         main()

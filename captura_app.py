@@ -7,10 +7,14 @@ Basado en el ejemplo oficial de Microsoft "ApplicationLoopback".
 
 CapturaApp(pid, excluir, al_recibir).iniciar() entrega bloques float32 mono a TASA_CAPTURA
 llamando a al_recibir(bloque) desde su propio hilo; detener() la corta.
+apps_con_audio() lista los programas con una sesión de audio en la salida predeterminada y
+pid_de_app(nombre) encuentra el proceso raíz de un programa, cuyo árbol se captura.
 """
 
 import ctypes
+import os
 import threading
+import time
 from ctypes import wintypes
 
 import comtypes
@@ -19,6 +23,8 @@ from comtypes import COMMETHOD, GUID, HRESULT, IUnknown
 
 TASA_CAPTURA = 48000
 CANALES = 2
+PERIODO_ENTREGA = 0.05                  # Cada cuánto se convierte y entrega lo capturado
+BUFFER_100NS = 200_000                  # 20 ms pedidos (Windows usa 10 ms igual en este modo)
 
 AUDCLNT_SHAREMODE_SHARED = 0
 AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
@@ -170,7 +176,7 @@ class CapturaApp(threading.Thread):
             formato = WAVEFORMATEX(1, CANALES, TASA_CAPTURA, TASA_CAPTURA * CANALES * 2, CANALES * 2, 16, 0)
             flags = (AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
                      | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY)
-            cliente.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200_000, 0, ctypes.byref(formato), None)  # 20 ms
+            cliente.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, BUFFER_100NS, 0, ctypes.byref(formato), None)
             cliente.SetEventHandle(evento)
             captura = cliente.GetService(ctypes.byref(IAudioCaptureClient._iid_)).QueryInterface(IAudioCaptureClient)
             cliente.Start()
@@ -181,19 +187,172 @@ class CapturaApp(threading.Thread):
             return
         self.lista.set()
         try:
+            # Windows usa un búfer de 10 ms aunque se pida más: cada paquete se lee apenas llega
+            # (esperar 40 ms perdía ~25 % del audio). Lo costoso (numpy y entregar el bloque) se
+            # hace cada PERIODO_ENTREGA con los bytes acumulados, no por cada paquete.
+            crudos, ultima = [], time.perf_counter()
             while self.seguir.is_set():
                 if kernel32.WaitForSingleObject(evento, 200) != 0:   # 0 = WAIT_OBJECT_0
                     continue
                 while captura.GetNextPacketSize():
                     datos, cuadros, flags_buf = captura.GetBuffer(None, None)
-                    if flags_buf & AUDCLNT_BUFFERFLAGS_SILENT:
-                        bloque = np.zeros(cuadros, np.float32)
-                    else:
-                        crudo = np.ctypeslib.as_array(ctypes.cast(datos, ctypes.POINTER(ctypes.c_int16)),
-                                                      shape=(cuadros * CANALES,))
-                        bloque = crudo.reshape(-1, CANALES).mean(axis=1).astype(np.float32) / 32768
+                    n = cuadros * CANALES * 2
+                    crudos.append(bytes(n) if flags_buf & AUDCLNT_BUFFERFLAGS_SILENT else ctypes.string_at(datos, n))
                     captura.ReleaseBuffer(cuadros)
-                    self.al_recibir(bloque)
+                if crudos and time.perf_counter() - ultima >= PERIODO_ENTREGA:
+                    pcm = np.frombuffer(b"".join(crudos), np.int16).reshape(-1, CANALES)
+                    self.al_recibir(pcm.mean(axis=1).astype(np.float32) / 32768)
+                    crudos, ultima = [], time.perf_counter()
         finally:
             cliente.Stop()
             kernel32.CloseHandle(evento)
+
+
+# ---------- Qué programas están sonando ----------
+class IMMDevice(IUnknown):
+    _iid_ = GUID("{D666063F-1587-4E43-81F1-B948E807363F}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "Activate", (["in"], ctypes.POINTER(GUID), "iid"), (["in"], wintypes.DWORD, "contexto"),
+                  (["in"], ctypes.c_void_p, "params"), (["out"], ctypes.POINTER(ctypes.POINTER(IUnknown)), "interfaz")),
+    ]
+
+
+class IMMDeviceEnumerator(IUnknown):
+    _iid_ = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "EnumAudioEndpoints", (["in"], ctypes.c_int, "flujo"), (["in"], wintypes.DWORD, "estado"),
+                  (["in"], ctypes.c_void_p, "lista")),
+        COMMETHOD([], HRESULT, "GetDefaultAudioEndpoint", (["in"], ctypes.c_int, "flujo"), (["in"], ctypes.c_int, "rol"),
+                  (["out"], ctypes.POINTER(ctypes.POINTER(IMMDevice)), "dispositivo")),
+    ]
+
+
+class IAudioSessionControl2(IUnknown):
+    _iid_ = GUID("{bfb7ff88-7239-4fc9-8fa2-07c950be9c6d}")
+    _methods_ = [   # IAudioSessionControl (9 métodos) y luego los de la versión 2
+        COMMETHOD([], HRESULT, "GetState", (["out"], ctypes.POINTER(ctypes.c_int), "estado")),
+        *[COMMETHOD([], HRESULT, f"_reservado{i}") for i in range(8)],
+        COMMETHOD([], HRESULT, "GetSessionIdentifier", (["in"], ctypes.c_void_p, "id")),
+        COMMETHOD([], HRESULT, "GetSessionInstanceIdentifier", (["in"], ctypes.c_void_p, "id")),
+        COMMETHOD([], HRESULT, "GetProcessId", (["out"], ctypes.POINTER(wintypes.DWORD), "pid")),
+    ]
+
+
+class IAudioSessionEnumerator(IUnknown):
+    _iid_ = GUID("{E2F5BB11-0570-40CA-ACDD-3AA01277DEE8}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "GetCount", (["out"], ctypes.POINTER(ctypes.c_int), "n")),
+        COMMETHOD([], HRESULT, "GetSession", (["in"], ctypes.c_int, "i"),
+                  (["out"], ctypes.POINTER(ctypes.POINTER(IUnknown)), "sesion")),
+    ]
+
+
+class IAudioSessionManager2(IUnknown):
+    _iid_ = GUID("{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}")
+    _methods_ = [   # IAudioSessionManager (2 métodos) y luego GetSessionEnumerator
+        COMMETHOD([], HRESULT, "_reservado0"),
+        COMMETHOD([], HRESULT, "_reservado1"),
+        COMMETHOD([], HRESULT, "GetSessionEnumerator",
+                  (["out"], ctypes.POINTER(ctypes.POINTER(IAudioSessionEnumerator)), "sesiones")),
+    ]
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def procesos():
+    """{pid: (pid del padre, nombre del ejecutable)} de todos los procesos."""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    foto = kernel32.CreateToolhelp32Snapshot(0x2, 0)    # TH32CS_SNAPPROCESS
+    tabla, e = {}, PROCESSENTRY32W()
+    e.dwSize = ctypes.sizeof(e)
+    try:
+        ok = kernel32.Process32FirstW(foto, ctypes.byref(e))
+        while ok:
+            tabla[e.th32ProcessID] = (e.th32ParentProcessID, e.szExeFile)
+            ok = kernel32.Process32NextW(foto, ctypes.byref(e))
+    finally:
+        kernel32.CloseHandle(foto)
+    return tabla
+
+
+def pids_con_audio():
+    """PIDs con una sesión de audio en la salida predeterminada (sin los sonidos del sistema)."""
+    enumerador = comtypes.CoCreateInstance(GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}"), IMMDeviceEnumerator,
+                                           comtypes.CLSCTX_ALL)
+    salida = enumerador.GetDefaultAudioEndpoint(0, 1)    # eRender, eMultimedia
+    gestor = salida.Activate(ctypes.byref(IAudioSessionManager2._iid_), comtypes.CLSCTX_ALL, None)
+    sesiones = gestor.QueryInterface(IAudioSessionManager2).GetSessionEnumerator()
+    pids = set()
+    for i in range(sesiones.GetCount()):
+        pid = sesiones.GetSession(i).QueryInterface(IAudioSessionControl2).GetProcessId()
+        if pid and pid != os.getpid():
+            pids.add(pid)
+    return pids
+
+
+# Procesos de Windows que lanzan apps: nunca son la raíz de una app
+PROCESOS_SISTEMA = {"explorer.exe", "svchost.exe", "services.exe", "wininit.exe", "winlogon.exe", "sihost.exe",
+                    "runtimebroker.exe", "smss.exe", "system", "[system process]", "userinit.exe", "dllhost.exe"}
+# Componentes que reproducen el audio en nombre de otra app (Teams y WhatsApp usan WebView2)
+AUXILIARES = {"msedgewebview2.exe"}
+
+
+def raiz(pid, tabla):
+    """Proceso raíz de la app dueña del audio. Se sube al padre si es el mismo programa (las
+    pestañas de Chrome, los procesos de Discord) o si el proceso es un auxiliar como WebView2
+    (Teams, WhatsApp). Una app abierta por otra (Zoom desde un enlace de Chrome) es propia."""
+    vistos = {pid}
+    while True:
+        padre = tabla[pid][0]
+        if padre not in tabla or padre in vistos or tabla[padre][1].lower() in PROCESOS_SISTEMA:
+            return pid
+        exe = tabla[pid][1].lower()
+        if tabla[padre][1].lower() != exe and exe not in AUXILIARES:
+            return pid
+        vistos.add(padre)
+        pid = padre
+
+
+def apps_con_audio(tabla=None, con_audio=None):
+    """Nombres de los programas (su raíz) con una sesión de audio, para elegir cuál escuchar."""
+    tabla = procesos() if tabla is None else tabla
+    con_audio = pids_con_audio() if con_audio is None else con_audio
+    return sorted({tabla[raiz(p, tabla)][1] for p in con_audio if p in tabla}, key=str.lower)
+
+
+def _cadena(pid, tabla):
+    """El proceso y sus ancestros dentro de la misma app, del más bajo a la raíz."""
+    cadena, tope = [pid], raiz(pid, tabla)
+    while pid != tope:
+        pid = tabla[pid][0]
+        cadena.append(pid)
+    return cadena
+
+
+def pid_de_app(nombre, tabla=None, con_audio=None):
+    """PID desde el que capturar el programa (p. ej. 'Discord.exe'), o None si no está abierto.
+
+    Windows captura el árbol completo del PID, y una app puede haber abierto otra (Zoom desde
+    un enlace de Chrome): por eso, si la app está sonando, se usa el ancestro común más bajo
+    de sus procesos con sesión de audio (en Chrome, su proceso de audio), y no su raíz. Si
+    todavía no suena, su raíz (que incluye al proceso que sonará)."""
+    tabla = procesos() if tabla is None else tabla
+    if con_audio is None:
+        try:
+            con_audio = pids_con_audio()
+        except (OSError, comtypes.COMError):
+            con_audio = set()
+    es = lambda pid: tabla[pid][1].lower() == nombre.lower()
+    cadenas = [_cadena(p, tabla) for p in sorted(con_audio) if p in tabla and es(raiz(p, tabla))]
+    if cadenas:
+        comunes = set(cadenas[0]).intersection(*cadenas[1:])
+        return next(p for p in cadenas[0] if p in comunes)  # El más bajo de los comunes
+    abiertos = sorted({raiz(p, tabla) for p in tabla if es(p)})
+    abiertos = [r for r in abiertos if es(r)]
+    return abiertos[0] if abiertos else None

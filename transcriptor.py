@@ -355,6 +355,48 @@ class Fuente:
                  "".join(f" {k}={v}" for k, v in stats.items()) or " ninguno", self.vad.ms_por_segundo())
 
 
+class FuenteApp(Fuente):
+    """Fuente "Otros" que escucha solo una aplicación, o todo menos una, en vez de todo el
+    sistema (captura_app.py: application loopback de Windows). Entrega trozos de TROZO
+    segundos con su hora y su nivel, igual que el callback de PyAudio."""
+
+    def __init__(self, nombre, app, excluir, cola):
+        from captura_app import TASA_CAPTURA
+        modo = "todo menos" if excluir else "solo"
+        super().__init__(nombre, {"maxInputChannels": 1, "defaultSampleRate": float(TASA_CAPTURA), "index": None,
+                                  "name": f"{modo} {_nombre_app(app)}"}, cola)
+        self.app, self.excluir = app, excluir
+        self.captura = None
+        self.pendiente = np.zeros(0, np.float32)
+
+    def abrir(self, pa=None):
+        from captura_app import CapturaApp, pid_de_app
+        pid = pid_de_app(self.app)
+        if pid is None:
+            raise RuntimeError(f"{_nombre_app(self.app)} no está abierto.")
+        self.captura = CapturaApp(pid, self._recibir, excluir=self.excluir).iniciar()
+
+    def _recibir(self, bloque):
+        """Junta los paquetes de Windows (~10 ms) en trozos de TROZO segundos."""
+        self.pendiente = np.concatenate([self.pendiente, bloque])
+        n = int(self.tasa * TROZO)
+        while len(self.pendiente) >= n:
+            x, self.pendiente = self.pendiente[:n], self.pendiente[n:]
+            fin = time.time() - len(self.pendiente) / self.tasa
+            self.nivel, self.t_nivel = float(np.sqrt(np.mean(x * x))), time.time()
+            self.cola.put((self, x, fin - n / self.tasa))
+
+    def cerrar_stream(self):
+        if self.captura is not None:
+            self.captura.detener()
+            self.captura = None
+
+
+def _nombre_app(exe):
+    """'Discord.exe' -> 'Discord', para mostrar."""
+    return exe[:-4] if exe.lower().endswith(".exe") else exe
+
+
 class Motor:
     """Un solo modelo Whisper y un solo hilo que atiende a todas las fuentes de audio
     (la GPU de 4 GB no da para dos modelos). Los finales tienen prioridad sobre los parciales."""
@@ -458,7 +500,25 @@ class Motor:
             mic.retirar = True              # El hilo cierra su última frase y la quita
             self.cola_ui.put(("estado", "Micrófono apagado"))
 
-    def iniciar(self, con_mic=False):
+    def _abrir_otros(self, escuchar):
+        """Fuente "Otros" abierta: todo el sistema, solo una app o todo menos una.
+        escuchar = None (todo el sistema) o ("solo" | "menos", "Discord.exe")."""
+        if escuchar is not None:
+            modo, app = escuchar
+            try:
+                otros = FuenteApp(NOMBRE_OTROS, app, modo == "menos", self.cola_audio)
+                otros.abrir()
+                return otros
+            except RuntimeError:
+                if modo == "solo":
+                    raise
+                # "Todo menos" una app cerrada es todo el sistema
+                self.cola_ui.put(("estado", f"{_nombre_app(app)} no está abierto: se escucha todo el sistema"))
+        otros = Fuente(NOMBRE_OTROS, self._dispositivo_loopback(), self.cola_audio)
+        otros.abrir(self.pa)
+        return otros
+
+    def iniciar(self, con_mic=False, escuchar=None):
         if self.hilo_activo():
             raise RuntimeError("La captura anterior aún se está cerrando, intenta de nuevo.")
         # Cola y evento nuevos por sesión: nada de una sesión anterior se mezcla con esta
@@ -466,8 +526,7 @@ class Motor:
         self.cola_audio = queue.Queue()
         self.pa = pyaudio.PyAudio()
         try:
-            otros = Fuente(NOMBRE_OTROS, self._dispositivo_loopback(), self.cola_audio)
-            otros.abrir(self.pa)
+            otros = self._abrir_otros(escuchar)
         except Exception:
             self.pa.terminate()
             self.pa = None
@@ -495,10 +554,10 @@ class Motor:
             self.stop.set()
         self.cola_ui.put(("estado", "Deteniendo..."))
 
-    def reconectar(self, con_mic):
+    def reconectar(self, con_mic, escuchar=None):
         """Vuelve a abrir la captura con los dispositivos predeterminados actuales de Windows
-        (p. ej. tras conectar audífonos), sin detener el hilo ni recargar el modelo.
-        Se llama desde la UI."""
+        (p. ej. tras conectar audífonos) o con otra app a escuchar, sin detener el hilo ni
+        recargar el modelo. Se llama desde la UI."""
         if self.pa is None:
             return
         # Las fuentes actuales se retiran: el hilo transcribe lo que alcanzó a llegar
@@ -509,8 +568,7 @@ class Motor:
         # PortAudio solo enumera los dispositivos al iniciarse: hay que reiniciarlo
         self.pa.terminate()
         self.pa = pyaudio.PyAudio()
-        otros = Fuente(NOMBRE_OTROS, self._dispositivo_loopback(), self.cola_audio)
-        otros.abrir(self.pa)
+        otros = self._abrir_otros(escuchar)
         self.fuentes.append(otros)
         self.cola_ui.put(("estado", f"Reconectado: {otros.disp['name']}"))
         if con_mic:
@@ -824,7 +882,9 @@ class Configuracion(dict):
                # Atajo de todo el sistema para entrar y salir de los subtítulos ("" = sin atajo global)
                "atajo_subtitulos": "Ctrl+Shift+S",
                # Traducción inglés -> español: "no", "ambos" (original + traducción) o "solo"
-               "traduccion": "no"}
+               "traduccion": "no",
+               # Qué audio del PC escuchar: "todo", "solo" una app o "menos" una app (escuchar_app)
+               "escuchar_modo": "todo", "escuchar_app": ""}
     LETRA_MIN, LETRA_MAX = 9, 36
     FRANJA_LINEAS_MAX = 4
 
@@ -970,6 +1030,9 @@ class App:
         self.config["franja_tamano"] = max(12, min(48, self.config["franja_tamano"]))
         if self.config["traduccion"] not in VISTAS_TRADUCCION.values():
             self.config["traduccion"] = "no"
+        if self.config["escuchar_modo"] not in ("todo", "solo", "menos") or \
+                (self.config["escuchar_modo"] != "todo" and not self.config["escuchar_app"]):
+            self.config["escuchar_modo"] = "todo"
         self.cola_ui = queue.Queue()
         self.motor = Motor(self.cola_ui)
         self.motor.cambiar_idioma(self.config["idioma"])
@@ -1011,6 +1074,12 @@ class App:
         self.btn_reconectar = tk.Button(barra, text="🔄 Reconectar", command=self.reconectar,
                                         state="disabled", **estilo)
         self.btn_reconectar.pack(side="left")
+        # Qué audio del PC escuchar: todo, solo una app (p. ej. Discord) o todo menos una (p. ej. Chrome)
+        self.btn_escuchar = tk.Menubutton(barra, text=self._texto_escucha(), **estilo)
+        self.menu_escuchar = tk.Menu(self.btn_escuchar, tearoff=False, bg="#2b2d31", fg=self.TEXTO,
+                                     activebackground="#3a3d43", postcommand=self._llenar_menu_escuchar)
+        self.btn_escuchar["menu"] = self.menu_escuchar
+        self.btn_escuchar.pack(side="left", padx=4)
         # Idioma que se habla en el audio (no traduce): aplica desde la próxima frase
         self.idioma = tk.StringVar(value=next(n for n, c in IDIOMAS.items() if c == self.config["idioma"]))
         menu = tk.OptionMenu(barra, self.idioma, *IDIOMAS, command=self._cambiar_idioma)
@@ -1029,8 +1098,6 @@ class App:
                        command=lambda: self.alternar_subtitulos(self.subtitulos.get()),
                        indicatoron=False, selectcolor="#2f4f7f", offrelief="flat", **estilo).pack(side="left")
         tk.Button(barra, text="⚙", command=self.abrir_ajustes, **estilo).pack(side="left", padx=4)
-        self.estado = tk.Label(barra, text="", bg=self.FONDO, fg=self.GRIS, anchor="e")
-        self.estado.pack(side="right", fill="x", expand=True)
 
         # Medidores de nivel por fuente (confirman que entra audio) e indicador de estado
         fila = tk.Frame(root, bg=self.FONDO)
@@ -1061,8 +1128,9 @@ class App:
         tk.Checkbutton(pie, text="Siempre encima", variable=self.encima, command=self._encima,
                        bg=self.FONDO, fg=self.TEXTO, selectcolor="#2b2d31",
                        activebackground=self.FONDO, activeforeground=self.TEXTO).pack(side="right")
-        tk.Label(pie, text="Ctrl+Espacio iniciar/detener · Ctrl+M micrófono · Ctrl +/− letra",
-                 bg=self.FONDO, fg=self.GRIS).pack(side="right", padx=12)
+        # Mensajes (qué se escucha, errores...): en el pie, donde hay espacio (los atajos, en Ajustes)
+        self.estado = tk.Label(pie, text="", bg=self.FONDO, fg=self.GRIS, anchor="e")
+        self.estado.pack(side="right", fill="x", expand=True, padx=12)
 
         # Fuentes con nombre: cambiar su tamaño actualiza todo el texto que las usa
         self.letra = tkfont.Font(family="Segoe UI", size=self.config["tamano_letra"])
@@ -1106,7 +1174,7 @@ class App:
             self._cancelar_timer_vram()
             self.hay_error = False
             try:
-                self.motor.iniciar(con_mic=self.mic.get())
+                self.motor.iniciar(con_mic=self.mic.get(), escuchar=self._escuchar())
             except Exception as e:
                 messagebox.showerror("Error de audio", str(e))
                 self._programar_liberar_vram()
@@ -1134,10 +1202,65 @@ class App:
         if not self.activo:
             return
         try:
-            self.motor.reconectar(con_mic=self.mic.get())
+            self.motor.reconectar(con_mic=self.mic.get(), escuchar=self._escuchar())
         except Exception as e:
             messagebox.showerror("Error de audio",
                                  f"{e}\n\nRevisa el dispositivo de salida en Windows y pulsa Reconectar otra vez.")
+
+    # ---------- Qué audio escuchar ----------
+    def _escuchar(self):
+        """None = todo el sistema; si no, ("solo" | "menos", "Discord.exe")."""
+        modo = self.config["escuchar_modo"]
+        return None if modo == "todo" else (modo, self.config["escuchar_app"])
+
+    def _texto_escucha(self):
+        modo, app = self.config["escuchar_modo"], _nombre_app(self.config["escuchar_app"])
+        return {"todo": "🔊 Todo", "solo": f"🔊 Solo {app}", "menos": f"🔊 Todo menos {app}"}[modo] + " ▾"
+
+    def _llenar_menu_escuchar(self, apps=None):
+        """Se rellena al abrir el menú: las apps que están sonando en ese momento."""
+        m = self.menu_escuchar
+        m.delete(0, "end")
+        actual = self.config["escuchar_modo"], self.config["escuchar_app"]
+        marca = lambda modo, app="": ("✓ " if actual == (modo, app) or (modo == "todo" == actual[0]) else "   ")
+        m.add_command(label=marca("todo") + "Todo el sistema", command=lambda: self._cambiar_escucha("todo", ""))
+        if apps is None:
+            try:
+                from captura_app import apps_con_audio
+                apps = apps_con_audio()
+            except Exception as e:
+                log.error("No se pudo listar las apps con audio: %s", e)
+                apps = []
+        if actual[1] and actual[1] not in apps:     # La elegida aunque ahora no suene
+            apps = sorted(apps + [actual[1]], key=str.lower)
+        m.add_separator()
+        if not apps:
+            m.add_command(label="   (ninguna app está sonando)", state="disabled")
+        for app in apps:
+            m.add_command(label=marca("solo", app) + f"Solo {_nombre_app(app)}",
+                          command=lambda a=app: self._cambiar_escucha("solo", a))
+        if apps:
+            m.add_separator()
+        for app in apps:
+            m.add_command(label=marca("menos", app) + f"Todo menos {_nombre_app(app)}",
+                          command=lambda a=app: self._cambiar_escucha("menos", a))
+
+    def _cambiar_escucha(self, modo, app):
+        """Se guarda; con la captura en marcha se aplica al tiro (como Reconectar)."""
+        anterior = self.config["escuchar_modo"], self.config["escuchar_app"]
+        self.config["escuchar_modo"], self.config["escuchar_app"] = modo, app
+        if self.activo:
+            try:
+                self.motor.reconectar(con_mic=self.mic.get(), escuchar=self._escuchar())
+            except Exception as e:
+                self.config["escuchar_modo"], self.config["escuchar_app"] = anterior
+                messagebox.showerror("Escuchar", f"{e}\n\nSe sigue escuchando como antes.")
+                try:
+                    self.motor.reconectar(con_mic=self.mic.get(), escuchar=self._escuchar())
+                except Exception as e2:
+                    log.error("No se pudo volver a la captura anterior: %s", e2)
+        self.config.guardar()
+        self.btn_escuchar.configure(text=self._texto_escucha())
 
     def _cambiar_idioma(self, nombre):
         self.motor.cambiar_idioma(IDIOMAS[nombre])
@@ -1351,8 +1474,9 @@ class App:
         m.grid(row=7, column=1, sticky="w")
         atajo = self.config["atajo_subtitulos"] or "ninguno"
         estado_atajo = "" if self.atajo_global is None or self.atajo_global.ok else " (no disponible)"
-        tk.Label(v, text=f"Atajo global: {atajo}{estado_atajo}\nSe cambia en {CONFIG_ARCHIVO}",
-                 bg=self.FONDO, fg=self.GRIS, justify="left", wraplength=300).grid(
+        tk.Label(v, text=f"Atajos: Ctrl+Espacio iniciar/detener · Ctrl+M micrófono · Ctrl +/− letra\n"
+                         f"Subtítulos, en todo el sistema: {atajo}{estado_atajo}\nSe cambia en {CONFIG_ARCHIVO}",
+                 bg=self.FONDO, fg=self.GRIS, justify="left", wraplength=320).grid(
             row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
         tk.Button(v, text="Cerrar", command=v.destroy, **self.estilo).grid(row=9, column=0, columnspan=2, pady=(12, 0))
 

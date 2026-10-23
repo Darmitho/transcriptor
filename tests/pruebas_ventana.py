@@ -240,7 +240,7 @@ def atajos():
         root = tk.Tk()
         app = T.App(root)
         llamadas = []
-        app.motor.iniciar = lambda con_mic=False: llamadas.append(("iniciar", con_mic))
+        app.motor.iniciar = lambda con_mic=False, escuchar=None: llamadas.append(("iniciar", con_mic))
         app.motor.detener = lambda: llamadas.append(("detener",))
         app.motor.activar_mic = lambda activo: llamadas.append(("mic", activo))
         root.deiconify()
@@ -461,8 +461,81 @@ def traduccion():
     return fallos
 
 
+def raiz_de_apps():
+    """Qué PID capturar por app, con una tabla de procesos como la de un equipo real."""
+    import captura_app as C
+    tabla = {4: (0, "System"), 100: (4, "explorer.exe"),
+             200: (100, "chrome.exe"), 201: (200, "chrome.exe"), 202: (200, "chrome.exe"),
+             300: (200, "Zoom.exe"), 301: (300, "Zoom.exe"),                 # Zoom abierto desde un enlace de Chrome
+             400: (100, "ms-teams.exe"), 401: (400, "msedgewebview2.exe"), 402: (401, "msedgewebview2.exe"),
+             500: (100, "Discord.exe"), 501: (500, "Discord.exe"), 502: (500, "Discord.exe"),
+             600: (100, "Spotify.exe")}                                      # Abierto pero en silencio
+    con_audio = {201, 301, 402, 501, 502}
+    fallos = []
+    apps = C.apps_con_audio(tabla, con_audio)
+    if apps != ["chrome.exe", "Discord.exe", "ms-teams.exe", "Zoom.exe"]:
+        fallos.append(("apps", apps))
+    esperado = {"chrome.exe": 201,       # Su proceso de audio: no arrastra a Zoom, que es hijo de Chrome
+                "Zoom.exe": 301, "ms-teams.exe": 402,
+                "Discord.exe": 500,      # Dos procesos con audio: su ancestro común
+                "Spotify.exe": 600,      # En silencio: su raíz
+                "NoExiste.exe": None}
+    for app, pid in esperado.items():
+        if C.pid_de_app(app, tabla, con_audio) != pid:
+            fallos.append(("pid_de_app", app, C.pid_de_app(app, tabla, con_audio), pid))
+    return fallos
+
+
+def selector_escuchar():
+    """Menú con las apps que suenan, cambio en marcha (como Reconectar), se recuerda, y si la
+    app no está abierta avisa y sigue como antes."""
+    from tkinter import messagebox
+    fallos = []
+    aviso = messagebox.showerror
+    avisos = []
+    messagebox.showerror = lambda *a, **k: avisos.append(a)
+    try:
+        with app_aislada():
+            root = tk.Tk()
+            app = T.App(root)
+            llamadas = []
+
+            def reconectar(con_mic, escuchar=None):
+                if escuchar == ("solo", "Cerrada.exe"):
+                    raise RuntimeError("Cerrada no está abierto.")
+                llamadas.append(escuchar)
+
+            app.motor.reconectar = reconectar
+            app.motor.iniciar = lambda con_mic=False, escuchar=None: llamadas.append(("iniciar", escuchar))
+            app._llenar_menu_escuchar(apps=["chrome.exe", "Discord.exe"])
+            etiquetas = [app.menu_escuchar.entrycget(i, "label").strip() for i in range(app.menu_escuchar.index("end") + 1)
+                         if app.menu_escuchar.type(i) == "command"]
+            if etiquetas != ["✓ Todo el sistema", "Solo chrome", "Solo Discord", "Todo menos chrome", "Todo menos Discord"]:
+                fallos.append(("menú", etiquetas))
+            app.cola_ui.put(("modelo_listo", None))
+            app._procesar_cola()
+            app.alternar()                  # Iniciar con todo el sistema
+            app.menu_escuchar.invoke(3)     # "Solo Discord" (0 todo, 1 separador, 2 chrome, 3 Discord)
+            texto = app.btn_escuchar.cget("text")
+            app._cambiar_escucha("solo", "Cerrada.exe")   # No está abierta: avisa y sigue con Discord
+            if llamadas != [("iniciar", None), ("solo", "Discord.exe"), ("solo", "Discord.exe")] or \
+                    texto != "🔊 Solo Discord ▾" or len(avisos) != 1 or app.config["escuchar_app"] != "Discord.exe":
+                fallos.append(("cambiar en marcha", llamadas, texto, avisos, app.config["escuchar_app"]))
+            app._cancelar_timer_vram()
+            root.destroy()
+
+            root = tk.Tk()                  # Se recuerda: la próxima vez arranca escuchando solo Discord
+            app = T.App(root)
+            if app._escuchar() != ("solo", "Discord.exe"):
+                fallos.append(("recordar", app._escuchar()))
+            root.destroy()
+    finally:
+        messagebox.showerror = aviso
+    return fallos
+
+
 PRUEBAS = [orden_cronologico, timer_vram, configuracion, letra_y_colores, medidores_y_estado, atajos,
-           subtitulos, atajo_global, traduccion]
+           subtitulos, atajo_global, traduccion, raiz_de_apps, selector_escuchar]
 
 
 def todas():
