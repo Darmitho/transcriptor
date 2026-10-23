@@ -4,3 +4,4 @@ psutil
 nvidia-ml-py
 sacrebleu
 sherpa-onnx
+comtypes
