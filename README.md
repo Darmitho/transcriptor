@@ -53,12 +53,26 @@ a CTranslate2 siguiendo [tools/convertir_traduccion.md](tools/convertir_traducci
 
 ## Uso
 
+### Acceso directo (doble clic)
+
+Crea una vez el acceso directo **Transcriptor en vivo** en el escritorio y en el menú Inicio:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\crear_acceso_directo.ps1
+```
+
+Abre la app sin ventana de consola, con su ícono en la barra de tareas. Usa el código del proyecto,
+así que los cambios se ven al volver a abrirla. Las métricas van a
+`%LOCALAPPDATA%\Transcriptor\transcriptor.log` (nunca el texto transcrito). Si ya está abierta,
+un segundo doble clic solo avisa. Si mueves la carpeta del proyecto, vuelve a crear el acceso.
+
+### Desde una terminal
+
 ```powershell
 venv\Scripts\python.exe transcriptor.py
 ```
 
-Conviene ejecutarlo desde una terminal: ahí aparecen las métricas de cada transcripción
-(tiempos, atraso, descartes), nunca el texto transcrito.
+Así las métricas de cada transcripción (tiempos, atraso, descartes) aparecen en la consola.
 
 1. Espera a que el botón **▶ Iniciar** se habilite (el modelo tarda unos segundos en cargar).
 2. Pulsa **▶ Iniciar**: empieza a transcribir lo que suena por la salida predeterminada de Windows.
@@ -78,7 +92,7 @@ Conviene ejecutarlo desde una terminal: ahí aparecen las métricas de cada tran
 | Español / English | Idioma que se habla en el audio; aplica desde la frase siguiente |
 | Sin traducir / Original + traducción / Solo traducción | Traduce al español las frases finales cuando el idioma es English. La traducción aparece ~0.3 s después del texto, en cursiva debajo del original o en su lugar; la franja de subtítulos sigue la misma vista |
 | CC Subtítulos | Alterna entre la ventana y la franja de subtítulos |
-| ⚙ | Ajustes: letra y colores de la ventana; tamaño, líneas, opacidad y posición de la franja |
+| ⚙ Ajustes | letra y colores de la ventana; tamaño, líneas, opacidad y posición de la franja |
 | Medidores Otros / Yo | Nivel de audio de cada fuente, para confirmar que entra sonido |
 | ● Estado | Detenido, Escuchando, Transcribiendo, Atrasado (cola de más de 1 s) o Error, con el atraso |
 | A− / A+ | Tamaño de la letra (9 a 36 pt) |
@@ -121,6 +135,7 @@ si otra app ya lo ocupa.
 | Qué | Dónde |
 |---|---|
 | Transcripciones (un `.txt` por sesión) | `%USERPROFILE%\Documents\Transcripciones` |
+| Registro al abrir con el acceso directo | `%LOCALAPPDATA%\Transcriptor\transcriptor.log` |
 | Preferencias de la ventana | `%LOCALAPPDATA%\Transcriptor\config.json` |
 | Modelo | `%USERPROFILE%\.cache\huggingface` |
 
@@ -133,7 +148,7 @@ hablarse la frase. Con la traducción activa, cada frase lleva debajo su versió
 
 ## Configuración
 
-**En la ventana (⚙)** se ajusta lo de uso diario; se guarda solo en `config.json`.
+**En la ventana (⚙ Ajustes)** se ajusta lo de uso diario; se guarda solo en `config.json`.
 
 **Al inicio de `transcriptor.py`** están los parámetros de fondo. Los más útiles:
 
@@ -181,6 +196,7 @@ Si otro programa usa la GPU al mismo tiempo, la latencia puede duplicarse.
 | Estado en amarillo ("Atrasado") seguido | La GPU no da abasto: cierra otros programas que la usen o prueba `MODELO = "medium"` |
 | "X no está abierto" al elegir Solo X | La app se cerró o aún no arrancó: ábrela y elige de nuevo en 🔊, o pulsa 🔄 Reconectar |
 | Ctrl+Shift+S no hace nada fuera de la ventana | Otra app ocupa el atajo (Ajustes dice "no disponible"): cámbialo en `atajo_subtitulos` |
+| El acceso directo no abre nada | Revisa `%LOCALAPPDATA%\Transcriptor\transcriptor.log`; si moviste la carpeta, vuelve a ejecutar `tools\crear_acceso_directo.ps1` |
 | `Error in sitecustomize ... pandas` en la consola | Viene de una configuración global de Python del equipo, no de este programa; no afecta |
 
 ## Para desarrollar

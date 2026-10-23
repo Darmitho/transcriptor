@@ -115,7 +115,17 @@ CONFIG_ARCHIVO = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser(
 if MODO_OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"   # Debe definirse antes de importar faster_whisper
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+# Con consola, las métricas van a la consola. Abierto desde el acceso directo (pythonw.exe) no
+# hay consola: van a un archivo junto a la configuración (solo métricas, nunca el texto)
+ARCHIVO_LOG = os.path.join(os.path.dirname(CONFIG_ARCHIVO), "transcriptor.log")
+if sys.stderr is not None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
+else:
+    from logging.handlers import RotatingFileHandler
+    os.makedirs(os.path.dirname(ARCHIVO_LOG), exist_ok=True)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+                        handlers=[RotatingFileHandler(ARCHIVO_LOG, maxBytes=1_000_000, backupCount=2,
+                                                      encoding="utf-8")])
 log = logging.getLogger("transcriptor")
 logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
@@ -1093,11 +1103,6 @@ class App:
         menu.configure(highlightthickness=0, **estilo)
         menu["menu"].configure(bg="#2b2d31", fg=self.TEXTO, activebackground="#3a3d43")
         menu.pack(side="left")
-        self.subtitulos = tk.BooleanVar(value=False)
-        tk.Checkbutton(barra, text="CC Subtítulos", variable=self.subtitulos,
-                       command=lambda: self.alternar_subtitulos(self.subtitulos.get()),
-                       indicatoron=False, selectcolor="#2f4f7f", offrelief="flat", **estilo).pack(side="left")
-        tk.Button(barra, text="⚙", command=self.abrir_ajustes, **estilo).pack(side="left", padx=4)
 
         # Medidores de nivel por fuente (confirman que entra audio) e indicador de estado
         fila = tk.Frame(root, bg=self.FONDO)
@@ -1124,6 +1129,12 @@ class App:
         tk.Button(pie, text="A+", command=lambda: self.cambiar_letra(+1), **estilo).pack(side="left", padx=(4, 12))
         tk.Button(pie, text="Limpiar", command=self.limpiar, **estilo).pack(side="left")
         tk.Button(pie, text="Guardar...", command=self.guardar, **estilo).pack(side="left", padx=4)
+        # Ajustes y subtítulos en el pie: arriba no cabían con etiquetas largas ("Todo menos ...")
+        tk.Button(pie, text="⚙ Ajustes", command=self.abrir_ajustes, **estilo).pack(side="left")
+        self.subtitulos = tk.BooleanVar(value=False)
+        tk.Checkbutton(pie, text="CC Subtítulos", variable=self.subtitulos,
+                       command=lambda: self.alternar_subtitulos(self.subtitulos.get()),
+                       indicatoron=False, selectcolor="#2f4f7f", offrelief="flat", **estilo).pack(side="left", padx=4)
         self.encima = tk.BooleanVar(value=self.config["siempre_encima"])
         tk.Checkbutton(pie, text="Siempre encima", variable=self.encima, command=self._encima,
                        bg=self.FONDO, fg=self.TEXTO, selectcolor="#2b2d31",
@@ -1215,6 +1226,7 @@ class App:
 
     def _texto_escucha(self):
         modo, app = self.config["escuchar_modo"], _nombre_app(self.config["escuchar_app"])
+        app = app if len(app) <= 14 else app[:13] + "…"     # "WhatsApp.Root" cabe; nombres más largos no
         return {"todo": "🔊 Todo", "solo": f"🔊 Solo {app}", "menos": f"🔊 Todo menos {app}"}[modo] + " ▾"
 
     def _llenar_menu_escuchar(self, apps=None):
@@ -1752,7 +1764,43 @@ class App:
             self.estado.configure(text="Error al guardar el .txt (ver consola)")
 
 
-if __name__ == "__main__":
+ICONO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "transcriptor.ico")
+
+
+def _ya_abierto():
+    """Una sola instancia: dos abiertas cargarían dos modelos en la GPU. El mutex con nombre lo
+    libera Windows al cerrarse el proceso, aunque se cierre mal."""
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    _ya_abierto.mutex = kernel32.CreateMutexW(None, False, "Local\\TranscriptorEnVivo")
+    return kernel32.GetLastError() == 183   # ERROR_ALREADY_EXISTS
+
+
+def main():
+    try:
+        import ctypes
+        # Ícono propio en la barra de tareas (si no, Windows agrupa la ventana con python.exe)
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Transcriptor.EnVivo")
+    except (AttributeError, OSError):
+        pass
     root = tk.Tk()
+    if os.path.exists(ICONO):
+        root.iconbitmap(default=ICONO)
+    if _ya_abierto():
+        root.withdraw()
+        messagebox.showinfo("Transcriptor en vivo", "El transcriptor ya está abierto.")
+        root.destroy()
+        return
+
+    def error_en_ventana(tipo, valor, traza):
+        # Sin consola un error se perdería en silencio: se registra y se avisa
+        log.error("Error inesperado en la ventana", exc_info=(tipo, valor, traza))
+        messagebox.showerror("Error inesperado", f"{valor}\n\nDetalles en {ARCHIVO_LOG}")
+
+    root.report_callback_exception = error_en_ventana
     App(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
